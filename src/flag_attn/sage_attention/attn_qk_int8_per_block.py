@@ -229,13 +229,8 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
         lse = torch.empty([0], dtype=torch.float32, device='cpu')
 
     grid = (triton.cdiv(qo_len, BLOCK_M), h_qo, b)
-    static_kv = (
-        tensor_layout == "HND"
-        and qo_len == kv_len
-        and kv_len in (1024, 2048, 4096)
-        and head_dim == 64
-        and attn_mask is None
-    )
+    # Full-static experiment: specialize every shape by its KV block count.
+    static_kv = True
     launch_options = {}
     if maxnreg is not None:
         if maxnreg <= 0:
