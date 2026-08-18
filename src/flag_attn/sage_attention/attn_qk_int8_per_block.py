@@ -16,24 +16,6 @@ import torch
 import triton
 import triton.language as tl
 
-_UNROLL_CONFIGS = [
-    triton.Config({"UNROLL": unroll}, num_warps=num_warps, num_stages=num_stages)
-    for num_warps, num_stages in ((4, 3), (8, 4))
-    for unroll in (1, 2, 4, 8, 16, 32)
-]
-
-def _prune_unroll_configs(configs, named_args, **kwargs):
-    kv_blocks = triton.cdiv(named_args["kv_len"], 64)
-    expected_warps = 4 if kwargs["HEAD_DIM"] == 64 else 8
-    return [
-        config
-        for config in configs
-        if config.num_warps == expected_warps
-        and config.kwargs["UNROLL"] <= kv_blocks
-        and kv_blocks % config.kwargs["UNROLL"] == 0
-    ]
-
-
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                     K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
@@ -94,62 +76,54 @@ def _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                            start_m, mask_ptrs, stride_maskn,
                            BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,
                            STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
-                           KV_BLOCKS: tl.constexpr, UNROLL: tl.constexpr,
+                           KV_BLOCKS: tl.constexpr,
                            ):
-    for group_start in range(0, KV_BLOCKS, UNROLL):
-        for offset in tl.static_range(0, UNROLL):
-            block_id = group_start + offset
-            start_n = block_id * BLOCK_N
-            K_block_ptrs = K_ptrs + start_n * stride_kn
-            K_scale_block_ptr = K_scale_ptr + block_id
-            V_block_ptrs = V_ptrs + start_n * stride_vn
-            mask_block = None
-            skip = False
-            if mask_ptrs is not None:
-                if mask_ptrs.dtype.element_ty == tl.int1:
-                    mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=False)
-                    if tl.max(mask_block) == 0:
-                        skip = True
+    for block_id in tl.static_range(0, KV_BLOCKS):
+        start_n = block_id * BLOCK_N
+        K_block_ptrs = K_ptrs + start_n * stride_kn
+        K_scale_block_ptr = K_scale_ptr + block_id
+        V_block_ptrs = V_ptrs + start_n * stride_vn
+        mask_block = None
+        skip = False
+        if mask_ptrs is not None:
+            if mask_ptrs.dtype.element_ty == tl.int1:
+                mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=False)
+                if tl.max(mask_block) == 0:
+                    skip = True
+            else:
+                mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=-1.0e6)
+        if not skip:
+            k_mask = offs_n[None, :] < (kv_len - start_n)
+            k = tl.load(K_block_ptrs, mask=k_mask)
+            k_scale = tl.load(K_scale_block_ptr)
+
+            qk = tl.dot(q, k).to(tl.float32) * (q_scale * k_scale)
+
+            if mask_block is not None:
+                if mask_block.dtype == tl.int1:
+                    qk = qk + tl.where(mask_block, 0, -1.0e6)
                 else:
-                    mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=-1.0e6)
-            if not skip:
-                k_mask = offs_n[None, :] < (kv_len - start_n)
-                k = tl.load(K_block_ptrs, mask=k_mask)
-                k_scale = tl.load(K_scale_block_ptr)
+                    qk = qk + mask_block
+            else:
+                qk += tl.where(k_mask, 0, -1.0e6)
 
-                qk = tl.dot(q, k).to(tl.float32) * (q_scale * k_scale)
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            qk = qk - m_ij[:, None]
+            p = tl.math.exp2(qk)
+            l_ij = tl.sum(p, 1)
 
-                if mask_block is not None:
-                    if mask_block.dtype == tl.int1:
-                        qk = qk + tl.where(mask_block, 0, -1.0e6)
-                    else:
-                        qk = qk + mask_block
-                else:
-                    qk += tl.where(k_mask, 0, -1.0e6)
+            alpha = tl.math.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
 
-                m_ij = tl.maximum(m_i, tl.max(qk, 1))
-                qk = qk - m_ij[:, None]
-                p = tl.math.exp2(qk)
-                l_ij = tl.sum(p, 1)
+            acc = acc * alpha[:, None]
 
-                alpha = tl.math.exp2(m_i - m_ij)
-                l_i = l_i * alpha + l_ij
+            v = tl.load(V_block_ptrs, mask = offs_n[:, None] < (kv_len - start_n))
+            p = p.to(tl.float16)
 
-                acc = acc * alpha[:, None]
-
-                v = tl.load(V_block_ptrs, mask = offs_n[:, None] < (kv_len - start_n))
-                p = p.to(tl.float16)
-
-                acc += tl.dot(p, v, out_dtype=tl.float16)
-                m_i = m_ij
+            acc += tl.dot(p, v, out_dtype=tl.float16)
+            m_i = m_ij
     return acc, l_i, m_i
 
-@triton.autotune(
-    configs=_UNROLL_CONFIGS,
-    key=["qo_len", "kv_len", "H", "HEAD_DIM", "num_kv_groups", "RETURN_LSE"],
-    prune_configs_by={"early_config_prune": _prune_unroll_configs},
-    cache_results=True,
-)
 @triton.jit
 def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
               stride_qz, stride_qh, stride_qn,
@@ -165,7 +139,6 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
               RETURN_LSE: tl.constexpr,
               STATIC_KV: tl.constexpr,
               KV_BLOCKS: tl.constexpr,
-              UNROLL: tl.constexpr,
               ):
     start_m = tl.program_id(0)
 
@@ -199,7 +172,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
         acc, l_i, m_i = _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
                                                start_m, mask_ptrs, stride_maskn,
                                                BLOCK_M, HEAD_DIM, BLOCK_N,
-                                               4 - STAGE, offs_m, offs_n, KV_BLOCKS, UNROLL
+                                               4 - STAGE, offs_m, offs_n, KV_BLOCKS
                                                )
     else:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
@@ -256,6 +229,13 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
         lse = torch.empty([0], dtype=torch.float32, device='cpu')
 
     grid = (triton.cdiv(qo_len, BLOCK_M), h_qo, b)
+    static_kv = (
+        tensor_layout == "HND"
+        and qo_len == kv_len
+        and kv_len in (1024, 2048, 4096)
+        and head_dim == 64
+        and attn_mask is None
+    )
     launch_options = {}
     if maxnreg is not None:
         if maxnreg <= 0:
@@ -272,15 +252,10 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
         qo_len, kv_len,
         h_qo, num_kv_groups,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM_K,
-        STAGE=stage, RETURN_LSE=return_lse,
-        STATIC_KV=(
-            tensor_layout == "HND"
-            and qo_len == kv_len
-            and kv_len in (1024, 2048, 4096)
-            and head_dim == 64
-            and attn_mask is None
-        ),
+        STAGE=stage, RETURN_LSE=return_lse, STATIC_KV=static_kv,
         KV_BLOCKS=triton.cdiv(kv_len, BLOCK_N),
+        num_warps=4 if head_dim == 64 else 8,
+        num_stages=1 if static_kv else 3 if head_dim == 64 else 4,
         **launch_options)
 
     return o, lse
