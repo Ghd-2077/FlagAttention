@@ -15,6 +15,7 @@
 import torch
 import triton
 import triton.language as tl
+import triton.experimental.tle.language as tle
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
@@ -94,7 +95,7 @@ def _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                 mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=-1.0e6)
         if not skip:
             k_mask = offs_n[None, :] < (kv_len - start_n)
-            k = tl.load(K_block_ptrs, mask=k_mask)
+            k = tle.load(K_block_ptrs, mask=k_mask, other=0, is_async=True)
             k_scale = tl.load(K_scale_block_ptr)
 
             qk = tl.dot(q, k).to(tl.float32) * (q_scale * k_scale)
@@ -117,7 +118,12 @@ def _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
 
             acc = acc * alpha[:, None]
 
-            v = tl.load(V_block_ptrs, mask = offs_n[:, None] < (kv_len - start_n))
+            v = tle.load(
+                V_block_ptrs,
+                mask=offs_n[:, None] < (kv_len - start_n),
+                other=0,
+                is_async=True,
+            )
             p = p.to(tl.float16)
 
             acc += tl.dot(p, v, out_dtype=tl.float16)
