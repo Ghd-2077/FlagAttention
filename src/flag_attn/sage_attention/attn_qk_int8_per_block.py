@@ -77,7 +77,7 @@ def _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                            start_m, mask_ptrs, stride_maskn,
                            BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,
                            STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
-                           KV_BLOCKS: tl.constexpr,
+                           KV_BLOCKS: tl.constexpr, FULL_KV: tl.constexpr,
                            ):
     for block_id in tl.static_range(0, KV_BLOCKS):
         start_n = block_id * BLOCK_N
@@ -94,8 +94,11 @@ def _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
             else:
                 mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=-1.0e6)
         if not skip:
-            k_mask = offs_n[None, :] < (kv_len - start_n)
-            k = tle.load(K_block_ptrs, mask=k_mask, other=0, is_async=True)
+            if FULL_KV:
+                k = tle.load(K_block_ptrs, is_async=True)
+            else:
+                k_mask = offs_n[None, :] < (kv_len - start_n)
+                k = tle.load(K_block_ptrs, mask=k_mask, other=0, is_async=True)
             k_scale = tl.load(K_scale_block_ptr)
 
             qk = tl.dot(q, k).to(tl.float32) * (q_scale * k_scale)
@@ -105,7 +108,7 @@ def _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                     qk = qk + tl.where(mask_block, 0, -1.0e6)
                 else:
                     qk = qk + mask_block
-            else:
+            elif not FULL_KV:
                 qk += tl.where(k_mask, 0, -1.0e6)
 
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
@@ -118,12 +121,15 @@ def _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
 
             acc = acc * alpha[:, None]
 
-            v = tle.load(
-                V_block_ptrs,
-                mask=offs_n[:, None] < (kv_len - start_n),
-                other=0,
-                is_async=True,
-            )
+            if FULL_KV:
+                v = tle.load(V_block_ptrs, is_async=True)
+            else:
+                v = tle.load(
+                    V_block_ptrs,
+                    mask=offs_n[:, None] < (kv_len - start_n),
+                    other=0,
+                    is_async=True,
+                )
             p = p.to(tl.float16)
 
             acc += tl.dot(p, v, out_dtype=tl.float16)
@@ -145,6 +151,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
               RETURN_LSE: tl.constexpr,
               STATIC_KV: tl.constexpr,
               KV_BLOCKS: tl.constexpr,
+              FULL_KV: tl.constexpr,
               ):
     start_m = tl.program_id(0)
 
@@ -178,7 +185,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
         acc, l_i, m_i = _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
                                                start_m, mask_ptrs, stride_maskn,
                                                BLOCK_M, HEAD_DIM, BLOCK_N,
-                                               4 - STAGE, offs_m, offs_n, KV_BLOCKS
+                                               4 - STAGE, offs_m, offs_n, KV_BLOCKS, FULL_KV
                                                )
     else:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
@@ -255,6 +262,7 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM_K,
         STAGE=stage, RETURN_LSE=return_lse, STATIC_KV=static_kv,
         KV_BLOCKS=triton.cdiv(kv_len, BLOCK_N),
+        FULL_KV=(kv_len % BLOCK_N == 0),
         num_warps=4 if head_dim == 64 else 8,
         num_stages=1 if static_kv else 3 if head_dim == 64 else 4,
         **launch_options)
