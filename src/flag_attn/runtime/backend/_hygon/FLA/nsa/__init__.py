@@ -12,20 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
+from .parallel_nsa import parallel_nsa
+from .parallel_nsa_compression import parallel_nsa_compression
 
-import torch
-
-
-# Hygon PyTorch exposes its device through the CUDA-compatible API.
-device = SimpleNamespace(vendor_name="hygon", name="cuda")
-torch_device_fn = torch.cuda
-
-
-class _Error:
-    @staticmethod
-    def backend_not_support(device_name):
-        raise RuntimeError(f"Backend {device_name!r} is not supported")
-
-
-error = _Error()
+__all__ = [
+    "parallel_nsa",
+    "parallel_nsa_compression",
+]

@@ -12,20 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
+from .index_topk import (
+    minimax_m3_index_decode,
+    minimax_m3_index_decode_score,
+    minimax_m3_index_score,
+    minimax_m3_index_topk,
+)
+from .sparse_attn import minimax_m3_sparse_attn, minimax_m3_sparse_attn_decode
 
-import torch
-
-
-# Hygon PyTorch exposes its device through the CUDA-compatible API.
-device = SimpleNamespace(vendor_name="hygon", name="cuda")
-torch_device_fn = torch.cuda
-
-
-class _Error:
-    @staticmethod
-    def backend_not_support(device_name):
-        raise RuntimeError(f"Backend {device_name!r} is not supported")
-
-
-error = _Error()
+__all__ = [
+    "minimax_m3_index_decode",
+    "minimax_m3_index_decode_score",
+    "minimax_m3_index_score",
+    "minimax_m3_index_topk",
+    "minimax_m3_sparse_attn",
+    "minimax_m3_sparse_attn_decode",
+]

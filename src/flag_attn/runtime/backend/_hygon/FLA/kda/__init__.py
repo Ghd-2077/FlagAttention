@@ -12,20 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
+from .chunk_kda import chunk_kda
 
-import torch
-
-
-# Hygon PyTorch exposes its device through the CUDA-compatible API.
-device = SimpleNamespace(vendor_name="hygon", name="cuda")
-torch_device_fn = torch.cuda
-
-
-class _Error:
-    @staticmethod
-    def backend_not_support(device_name):
-        raise RuntimeError(f"Backend {device_name!r} is not supported")
-
-
-error = _Error()
+__all__ = ["chunk_kda"]
