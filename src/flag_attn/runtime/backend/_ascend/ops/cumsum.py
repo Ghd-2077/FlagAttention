@@ -228,4 +228,3 @@ def chunk_local_cumsum(
             f"which should be (B, T, H, D) if `head_first=False` "
             f"or (B, H, T, D) otherwise",
         )
-
