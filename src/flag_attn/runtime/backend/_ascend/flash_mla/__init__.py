@@ -4,6 +4,7 @@ import importlib
 _OPERATOR_EXPORTS = {
     "FlashMLADecodePlan": (".dense", "FlashMLADecodePlan"),
     "flash_mla": (".dense", "flash_mla"),
+    "flash_mla_sparse_fwd": (".sparse", "flash_mla_sparse_fwd"),
 }
 __all__ = sorted(_OPERATOR_EXPORTS)
 
