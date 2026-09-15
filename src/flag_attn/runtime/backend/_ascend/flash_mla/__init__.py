@@ -5,6 +5,8 @@ _OPERATOR_EXPORTS = {
     "FlashMLADecodePlan": (".dense", "FlashMLADecodePlan"),
     "flash_mla": (".dense", "flash_mla"),
     "flash_mla_sparse_fwd": (".sparse", "flash_mla_sparse_fwd"),
+    "flash_mla_with_kvcache": (".kvcache", "flash_mla_with_kvcache"),
+    "flash_mla_sparse_decode": (".kvcache", "flash_mla_sparse_decode"),
 }
 __all__ = sorted(_OPERATOR_EXPORTS)
 
