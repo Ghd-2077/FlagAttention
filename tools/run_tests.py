@@ -37,8 +37,9 @@ Output layout::
         |-- performance_result.json
         |-- accuracy_stdout.log       # with --dump-output
         |-- accuracy_stderr.log       # with --dump-output
-        |-- performance_stdout.log    # with --dump-output
-        |-- performance_stderr.log    # with --dump-output
+        |-- performance_stdout.log    # human-readable benchmark output
+        |-- performance_stderr.log
+        |-- performance_records_0.log # FlagGems-compatible benchmark records
         `-- performance_artifacts/
 """
 
@@ -48,6 +49,7 @@ import argparse
 import datetime as dt
 import importlib.util
 import json
+import math
 import os
 import platform
 import queue as queue_module
@@ -310,10 +312,19 @@ def probe_environment() -> dict[str, Any]:
     except (AttributeError, OSError):
         os_release = {}
 
+    try:
+        import distro
+
+        os_name = distro.id()
+        os_version = distro.version()
+    except ImportError:
+        os_name = os_release.get("ID", platform.system())
+        os_version = os_release.get("VERSION_ID", platform.release())
+
     environment: dict[str, Any] = {
         "architecture": platform.machine(),
-        "os_name": os_release.get("ID", platform.system()),
-        "os_release": os_release.get("VERSION_ID", platform.release()),
+        "os_name": os_name,
+        "os_release": os_version,
         "python": platform.python_version(),
     }
 
@@ -356,7 +367,16 @@ def probe_environment() -> dict[str, Any]:
         flag_attn_version = metadata.version("flag_attn")
     except metadata.PackageNotFoundError:
         flag_attn_version = "source tree"
-    environment["flag_attn"] = {"version": flag_attn_version}
+    try:
+        import flag_attn
+
+        environment["flag_attn"] = {
+            "version": getattr(flag_attn, "__version__", flag_attn_version),
+            "vendor": getattr(flag_attn, "vendor_name", "unknown"),
+            "device": getattr(flag_attn, "device", "unknown"),
+        }
+    except Exception as exc:
+        raise RuntimeError(f"FlagAttention cannot be imported: {exc}") from exc
     return environment
 
 
@@ -396,11 +416,12 @@ def subprocess_environment(root: Path, gpu_id: int) -> dict[str, str]:
     environment["CUDA_VISIBLE_DEVICES"] = selected_device
     environment["PYTHONUNBUFFERED"] = "1"
     source_path = str(root / "src")
+    repository_path = str(root)
     current_pythonpath = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = (
-        source_path + os.pathsep + current_pythonpath
+        os.pathsep.join((source_path, repository_path, current_pythonpath))
         if current_pythonpath
-        else source_path
+        else os.pathsep.join((source_path, repository_path))
     )
     return environment
 
@@ -566,6 +587,12 @@ def parse_junit(path: Path, exit_code: int) -> dict[str, Any]:
             message = outcome_element.attrib.get("message") or (
                 outcome_element.text or ""
             ).strip()
+            if outcome == "skipped":
+                # Collection skips use the generic message "collection skipped";
+                # the unavailable module or device is described in the body.
+                reason = (outcome_element.text or "").strip()
+                if reason and reason not in message:
+                    message = f"{message}\n{reason}"
             details.setdefault(outcome, []).append(
                 {"test": nodeid, "reason": message[:4000]}
             )
@@ -577,7 +604,11 @@ def parse_junit(path: Path, exit_code: int) -> dict[str, Any]:
         status = "Error"
     elif counts["failed"] or exit_code == 1:
         status = "Failed"
-    elif exit_code == 5 or total == 0:
+    elif exit_code == 5:
+        # A module-level importorskip collects no runnable tests (exit 5),
+        # but pytest still records why the module was skipped in JUnit.
+        status = "Skipped" if total and counts["skipped"] == total else "NotFound"
+    elif total == 0:
         status = "NotFound"
     elif exit_code != 0:
         status = "Error"
@@ -630,11 +661,18 @@ def run_accuracy(
         "no:cacheprovider",
         "--tb=short",
         "-ra",
+        "--continue-on-collection-errors",
     ]
     if config["dump_output"]:
         # Match the reference runners' -s behavior so prints from passing tests
         # are present in accuracy_stdout.log as well as failure diagnostics.
         command.append("-s")
+    if config["quick"]:
+        command.append("--quick")
+    # The FlagGems runner adds `--ref cpu` for tests that have a CPU reference.
+    # FlagAttention does not implement that pytest option: its tests use the
+    # repository's own `flag_attn.testing` references and are CUDA-oriented.
+    # Keep this intentionally disabled instead of passing an unsupported option.
     exit_code, duration, _ = run_command(
         command,
         cwd=Path(config["root"]),
@@ -657,6 +695,68 @@ def run_accuracy(
     )
     write_json(result_path, result)
     return result
+
+
+def _finite_number(value: Any) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _valid_benchmark_metric(metric: Any) -> bool:
+    if not isinstance(metric, dict) or not all(
+        field in metric
+        for field in ("shape_detail", "latency_base", "latency", "speedup")
+    ):
+        return False
+    latency = metric["latency"]
+    if latency is not None and (not _finite_number(latency) or latency <= 0):
+        return False
+    return all(
+        metric[field] is None
+        or (_finite_number(metric[field]) and metric[field] > 0)
+        for field in ("latency_base", "speedup")
+    )
+
+
+def count_flaggems_records(path: Path, start_offset: int = 0) -> int:
+    """Count parseable FlagGems benchmark records in a log file."""
+
+    if not path.is_file():
+        return 0
+    count = 0
+    with path.open("rb") as stream:
+        stream.seek(start_offset)
+        for line in stream:
+            if not line.startswith(b"[INFO] {"):
+                continue
+            try:
+                record = json.loads(line[len(b"[INFO] ") :])
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            if not all(
+                isinstance(record.get(field), str) and record[field]
+                for field in ("op_name", "dtype", "mode", "level")
+            ):
+                continue
+            metrics = record.get("result")
+            if (
+                isinstance(metrics, list)
+                and metrics
+                and all(_valid_benchmark_metric(metric) for metric in metrics)
+                and any(
+                    not metric.get("error_msg")
+                    and metric["latency"] is not None
+                    for metric in metrics
+                )
+            ):
+                count += 1
+    return count
 
 
 def run_performance(
@@ -708,9 +808,19 @@ def run_performance(
     artifacts_dir = op_dir / "performance_artifacts"
     ensure_dir(artifacts_dir)
     records: list[dict[str, Any]] = []
+    stdout_path = op_dir / "performance_stdout.log"
     for index, benchmark in enumerate(benchmarks):
         script = (Path(config["root"]) / benchmark).resolve()
         command = [config["python"], "-u", str(script)]
+        # Keep independent records for each script. Remove records from an
+        # earlier run so a script without measurements cannot appear to pass.
+        records_path = op_dir / f"performance_records_{index}.log"
+        records_path.unlink(missing_ok=True)
+        environment = subprocess_environment(Path(config["root"]), gpu_id)
+        environment["FLAG_ATTN_BENCHMARK_LOG_PATH"] = str(records_path.resolve())
+        # Legacy scripts may still write FlagGems rows to stdout. Only count
+        # lines added by the current script when using that compatibility path.
+        stdout_start = stdout_path.stat().st_size if index and stdout_path.exists() else 0
         artifacts_before = {
             path.relative_to(artifacts_dir): (path.stat().st_mtime_ns, path.stat().st_size)
             for path in artifacts_dir.rglob("*")
@@ -719,11 +829,13 @@ def run_performance(
         exit_code, duration, output_bytes = run_command(
             command,
             cwd=artifacts_dir,
-            environment=subprocess_environment(Path(config["root"]), gpu_id),
+            environment=environment,
             timeout=config["benchmark_timeout"],
             output_dir=op_dir,
             flavor="performance",
-            dump_output=config["dump_output"],
+            # Keep human-readable benchmark tables and diagnostics even when
+            # accuracy output dumping is disabled.
+            dump_output=True,
             append=index > 0,
         )
         artifacts_after = {
@@ -736,32 +848,47 @@ def run_performance(
             for path, signature in artifacts_after.items()
             if artifacts_before.get(path) != signature
         )
+        sidecar_count = count_flaggems_records(records_path) if exit_code == 0 else 0
+        legacy_count = (
+            count_flaggems_records(stdout_path, stdout_start) if exit_code == 0 else 0
+        )
+        record_count = sidecar_count or legacy_count
+        record_file = (
+            records_path if sidecar_count else stdout_path if legacy_count else None
+        )
         if exit_code == TIMEOUT:
             status = "Timeout"
         elif exit_code != 0:
             status = "Failed"
-        elif output_bytes == 0 and not artifacts_changed:
-            status = "Skipped"
+        elif record_count == 0:
+            status = "Failed"
         else:
             status = "Passed"
-        records.append(
-            {
-                "script": benchmark,
-                "command": command,
-                "status": status,
-                "exit_code": exit_code,
-                "duration": round(duration, 3),
-                "output_bytes": output_bytes,
-                "artifacts_changed": artifacts_changed,
-                "measurement": (
-                    "artifacts"
-                    if artifacts_changed
-                    else "console"
-                    if output_bytes
-                    else "none"
-                ),
-            }
-        )
+        record = {
+            "script": benchmark,
+            "command": command,
+            "status": status,
+            "exit_code": exit_code,
+            "duration": round(duration, 3),
+            "output_bytes": output_bytes,
+            "artifacts_changed": artifacts_changed,
+            "record_count": record_count,
+            "record_file": (
+                str(record_file.relative_to(output_root)) if record_file else None
+            ),
+            "measurement": (
+                "artifacts"
+                if artifacts_changed
+                else "records"
+                if sidecar_count
+                else "console"
+                if output_bytes
+                else "none"
+            ),
+        }
+        if status == "Failed" and exit_code == 0:
+            record["error"] = "benchmark did not write a valid [INFO] JSON result record"
+        records.append(record)
 
     statuses = {record["status"] for record in records}
     if "Timeout" in statuses:
@@ -1066,6 +1193,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="timeout for each benchmark script",
     )
     parser.add_argument(
+        "--quick",
+        action="store_true",
+        help=(
+            "enable the shared runner's quick-test option; FlagAttention currently "
+            "keeps the test-declared parameter sets"
+        ),
+    )
+    parser.add_argument(
         "--list-ops",
         action="store_true",
         help="list selected inventory entries without probing GPUs",
@@ -1082,9 +1217,9 @@ def build_parser() -> argparse.ArgumentParser:
 def has_failures(results: dict[str, Any]) -> bool:
     bad_statuses = {"Failed", "Error", "Timeout"}
     return any(
-        record.get(phase, {}).get("status") in bad_statuses
+        record.get("accuracy", {}).get("status") in bad_statuses | {"NotFound"}
+        or record.get("performance", {}).get("status") in bad_statuses
         for record in results.values()
-        for phase in ("accuracy", "performance")
     )
 
 
@@ -1136,8 +1271,8 @@ def main(argv: list[str] | None = None) -> int:
         output_dir = (Path.cwd() / f"logs_results_{stamp}").resolve()
     ensure_dir(output_dir)
 
-    # Known log files are per-run data.  Remove them for selected operators so
-    # an output directory reused without --dump-output never exposes stale logs.
+    # Known log files are per-run data. Remove them for selected operators so
+    # a reused output directory never exposes stale benchmark records.
     for operator in operators:
         op_dir = output_dir / operator["id"]
         for log_name in (
@@ -1158,6 +1293,7 @@ def main(argv: list[str] | None = None) -> int:
         "skip_benchmarks": args.skip_benchmarks,
         "accuracy_timeout": args.timeout,
         "benchmark_timeout": args.benchmark_timeout,
+        "quick": args.quick,
     }
     write_json(
         output_dir / "run_config.json",
@@ -1169,6 +1305,7 @@ def main(argv: list[str] | None = None) -> int:
             "skip_benchmarks": args.skip_benchmarks,
             "accuracy_timeout": args.timeout,
             "benchmark_timeout": args.benchmark_timeout,
+            "quick": args.quick,
         },
     )
     # Initialize this run's summaries before workers start.  This prevents a
