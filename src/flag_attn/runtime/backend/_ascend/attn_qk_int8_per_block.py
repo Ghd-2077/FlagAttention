@@ -271,7 +271,8 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
     if maxnreg is not None:
         if maxnreg <= 0:
             raise ValueError("maxnreg must be positive")
-        launch_options["maxnreg"] = maxnreg
+        # Triton-Ascend does not expose CUDA's maxnreg launch option. Keep the
+        # argument for API compatibility and validation, but do not forward it.
 
     _attn_fwd[grid](
         q, k, v, q_scale, k_scale, o, attn_mask, lse,
