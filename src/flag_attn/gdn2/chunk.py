@@ -1,29 +1,41 @@
-"""Optimized BT=16 NVIDIA GDN2 inference using TLE fused kernels.
+"""BT=16 inference kernels for GDN2 prefill.
 
-The original native baseline is kept outside the package in BaselineBenchmark.
+Two forward paths with identical semantics share one public entry, ``chunk_gdn2``:
+
+* TLE path (``chunk_gdn2_fwd_infer``): TMA-accelerated, warp-specialized fused
+  kernels. Selected automatically when the Triton TLE extension is available.
+* Native Triton fallback: portable kernels used when TLE is unavailable.
+
+``chunk_gdn2`` validates inputs first, then dispatches: TLE if available,
+otherwise Triton.
 """
 
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+# 此仓库的pre index的入口参数没有BT，不支持varlen
+from flag_attn.utils import has_triton_tle
 from flag_attn.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
 
-from flag_attn.runtime import autotune_cache_kwargs as _autotune_cache_kwargs
-from ..ops.math import exp2
-from ..ops.softplus import softplus
-
-autotune_cache_kwargs = _autotune_cache_kwargs()
+from .native.chunk_fwd import chunk_gdn2_fwd
+from .triton_ops_helper import autotune_cache_kwargs, exp2
 
 LN2 = 0.6931471805599453
 RCP_LN2 = 1.4426950408889634
 
-try:
-    import triton.experimental.tle.language as tle
-    HAS_TLE_GDN2 = True
-except ImportError:
+if has_triton_tle(3, 6, 0) and hasattr(triton._C.libtriton.ir.builder, 'make_swizzled_shared_encoding_attr'):
+    try:
+        import triton.experimental.tle.language as tle
+
+        HAS_TLE_GDN2 = True
+    except ImportError:
+        tle = None
+        HAS_TLE_GDN2 = False
+else:
     tle = None
     HAS_TLE_GDN2 = False
 
@@ -34,6 +46,62 @@ K1_TLE_MAXNREG_CANDIDATES = (64, 72, 96)
 K1_TLE_SMEM_REUSE_MIN_K = 256
 
 
+def _generate_constraints(num_pack):
+    return (
+        ",".join("=r" for i in range(num_pack))
+        + ","
+        + ",".join("r" for i in range(num_pack))
+    )
+
+
+def _generate_softplus(num_pack):
+    template = """
+        .reg .pred p;
+        setp.gt.f32  p, ${in_reg}, 20.;
+        @p  mov.f32  ${out_reg}, ${in_reg};
+        @!p mul.f32            ${out_reg}, ${in_reg}, 1.4426950408889634;
+        @!p ex2.approx.ftz.f32 ${out_reg}, ${out_reg};
+        @!p add.f32            ${out_reg}, ${out_reg}, 1.0;
+        @!p lg2.approx.ftz.f32 ${out_reg}, ${out_reg};
+        @!p mul.f32            ${out_reg}, ${out_reg}, 0.6931471805599453;
+    """
+    out_str = ""
+
+    for i in range(num_pack):
+        inner_str = template.format(out_reg=i, in_reg=i + num_pack)
+        out_str += "{" + inner_str + "}\n"
+    # flatten out because torch.compile doesn't like newlines
+    out_str = " ".join(out_str.split("\n"))
+    return out_str
+
+
+_NUM_REG = 1
+s_softplus: tl.constexpr = tl.constexpr(_generate_softplus(_NUM_REG))
+s_constraints: tl.constexpr = tl.constexpr(_generate_constraints(_NUM_REG))
+NUM_REG: tl.constexpr = tl.constexpr(_NUM_REG)
+
+
+@triton.jit
+def softplus_nv(x):
+    # equivalent to:
+    # return tl.where(x < 20.0, tl.math.log(1 + tl.math.exp(x)), x)
+    return tl.inline_asm_elementwise(
+        asm=s_softplus,
+        constraints=s_constraints,
+        pack=NUM_REG,
+        args=[
+            x,
+        ],
+        dtype=tl.float32,
+        is_pure=True,
+    )
+
+
+softplus = softplus_nv
+
+# triton实现
+
+# 3. TLE kernels for GDN-2 prefill, BT=16, inference path.
 if HAS_TLE_GDN2:
 
     # =============================================================================
@@ -1429,7 +1497,49 @@ def chunk_gdn2(
     chunk_indices=None,
 ):
     if not HAS_TLE_GDN2:
-        raise RuntimeError("NVIDIA GDN2 requires Triton with the TLE extension.")
+        if scale is None:
+            scale = q.shape[-1] ** -0.5
+        if use_qk_l2norm_in_kernel:
+            q = F.normalize(q.float(), p=2, dim=-1, eps=1e-6).to(q.dtype)
+            k = F.normalize(k.float(), p=2, dim=-1, eps=1e-6).to(k.dtype)
+        (
+            o,
+            final_state,
+            _g,
+            _Aqk,
+            _Akk,
+            _w_wy,
+            _u_wy,
+            _qg,
+            _kg,
+            _v_new,
+            h,
+            _initial_state,
+        ) = chunk_gdn2_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            b=b,
+            w_gate=w,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            state_v_first=state_v_first,
+            use_gate_in_kernel=use_gate_in_kernel,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+            chunk_size=chunk_size,
+            return_intermediate_states=return_intermediate_states,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            chunk_indices=chunk_indices,
+        )
+        if return_intermediate_states:
+            return o, final_state, h
+        return o, final_state
 
     return chunk_gdn2_fwd_infer(
         q=q,

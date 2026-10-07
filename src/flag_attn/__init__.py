@@ -46,7 +46,7 @@ from flag_attn import testing # noqa: F401
 
 _FLA_EXPORTS = {
     "chunk_gdn2": (
-        "flag_attn.runtime.backend._nvidia.gdn2",
+        "flag_attn.gdn2",
         "chunk_gdn2",
     ),
     "chunk_kda": (
