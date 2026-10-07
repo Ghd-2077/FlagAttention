@@ -11,23 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import importlib
-
-_OPERATOR_EXPORTS = {
-    "chunk_gdn2": (".gdn2", "chunk_gdn2"),
-    "sage_attention_forward": (".sage_attention", "forward"),
-}
-
-
-def __getattr__(name):
-    try:
-        module, symbol = _OPERATOR_EXPORTS[name]
-    except KeyError as exc:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
-    value = getattr(importlib.import_module(module, __name__), symbol)
-    globals()[name] = value
-    return value
-
-
-__all__ = sorted(_OPERATOR_EXPORTS)

@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flag_attn.runtime.backend import get_backend_name
+import torch
 
-if get_backend_name() == "nvidia":
-    from flag_attn.runtime.backend._nvidia.sage_attention import forward
-    from flag_attn.runtime.backend._nvidia.ops import per_block_int8
+if hasattr(torch, "npu") and torch.npu.is_available():
+    from flag_attn.runtime.backend._ascend import forward, per_block_int8
 else:
     from .attn_qk_int8_per_block import forward
     from .quant_per_block import per_block_int8
