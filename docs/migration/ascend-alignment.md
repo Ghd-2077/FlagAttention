@@ -95,17 +95,17 @@ Before-migration latency (ms):
 Protocol exit 0. The old NSA benchmark is byte-identical to the common
 ancestor; accepting its upstream rename does not drop fork-specific changes.
 
-## Registration audit (to be completed in P2)
+## Registration audit (P2)
 
 | Operator | Contract boundary | Initial decision |
 | --- | --- | --- |
-| GDN2 | Inference only, BT=16; public generic has additional controls | Explicit adapter and unsupported-training errors required |
-| Sage | Public forward aliases and shared quantization; existing masked framework path | Preserve fork behavior and wire aliases |
-| GLA | Compare signature, return, variable length and backward | Pending comparison |
-| KDA | Registry key `chunk_kda_fwd_infer`; Ascend wrapper has distinct defaults/options | Adapter or intentional internal-only entry |
+| GDN2 | Inference only, BT=16 | Registered through `gdn2/api.py`, exact public parameter order; differentiable calls fail explicitly; original internal entry preserved |
+| Sage | Public forward aliases and shared quantization; existing masked framework path | Registered with upstream aliases, fork mask/maxnreg behavior preserved |
+| GLA | Same parameters/defaults, output/final state, variable length and backward | Registered to `gla.chunk_gla`; NPU regressions in P3 |
+| KDA | Registry key `chunk_kda_fwd_infer`; Ascend wrapper has distinct defaults/options | Registered through matching inference signature, preserves `safe_gate=False` default; rejects precomputed chunk_indices explicitly |
 | NSA selected | Returns output/LSE, lacks full backward API | Keep internal; do not register as full `parallel_nsa` |
-| NSA compression | Compare trainable API and controls | Pending comparison |
-| MiniMax | Prefill/decode/index are separate primitives | Compare/register each independently |
+| NSA compression | Same q/k/v/block_size/scale/cu_seqlens and output/LSE; backward supported | Registered to `nsa.compression`; NPU regressions in P3 |
+| MiniMax | Prefill and four index primitives match parameter/default/return contracts | Registered prefill and index primitives; decode attention intentionally not registered because fork simply reexports Generic; no independent Ascend decode implementation |
 | ops | Internal shared primitives without public generic contracts | Keep internal |
 
 ## Stage gates
@@ -122,4 +122,10 @@ ancestor; accepting its upstream rename does not drop fork-specific changes.
   Logs: `/tmp/migration-p1-tests{,-rerun}.log` in the container.
   Local Windows lacks torch/Triton; real imports/tests ran in the existing
   Ascend container using the isolated migration directory.
-- P2-P4: not yet performed.
+- P2: dispatch/contracts PASS, NPU correctness pending P3. Added adapters and
+  the single `_ascend._OPERATOR_EXPORTS` table; no second dispatcher. Registry
+  override/fallback/dependency propagation, exact adapter parameter order,
+  inference guards and internal primitive isolation tested with CPU tensors/mocks.
+  Runtime + runner + registry: **52 passed**, exit 0, `/tmp/migration-p2-tests.log`.
+  These results do not establish NPU mathematical correctness.
+- P3-P4: not yet performed.
