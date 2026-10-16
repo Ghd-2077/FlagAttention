@@ -37,7 +37,7 @@ from the existing toolkit without replacing its compiler PATH.
 | P1 GLA forward | PASS | 17 passed, exit 0, real 910B |
 | P2 NSA forward | PASS | Final combined run: 39 passed, exit 0 |
 | P3 strict runner | PASS | 30 CPU/CLI tests passed locally and in container |
-| P4 NPU regression | NOT RUN | Historical logs do not count |
+| P4 NPU regression | PASS | 83 CPU/contract tests, 54 NPU forward/guard cases; strict runner exit 0 |
 | P5 performance/CI | NOT RUN | Historical timings do not count |
 
 ## Fork ownership review
@@ -144,3 +144,74 @@ python -m pytest -q --confcutdir=tests/flag_attn \
 ```
 
 No NPU mathematical correctness is inferred from these CPU/mock tests.
+
+## P4 — Fresh integrated forward gate
+
+Production source at P3 commit `1a097ec`, plus only the P4 test additions,
+was transferred to the isolated container checkout. Before tests, assertions
+verified vendor `ascend`, device `npu`, actual NPU availability and that the
+imported package resides in the current checkout (not an installed old copy).
+
+The first integrated command passed 83 CPU/contract and 53 forward/guard tests,
+and the strict runner, but **exited 2** at Linux `git diff --check`: source
+transport inherited the Windows host's system `core.autocrlf=true`. Committed
+Git blobs were confirmed LF. Even `git archive` applies working-tree conversion,
+so the first archive retry still failed. Fixed transport with command-local
+`git -c core.autocrlf=false -c core.eol=lf archive`; no global config changes,
+kernel rewriting or ignored whitespace checks. Failed logs are retained as
+`p4-acceptance.log` and `p4-static.log`; successful static retry is
+`p4-static-lf.log`, exit 0.
+
+Added one explicit Sage top-level/namespace forward alias test with uniform
+attention output/LSE and invalid quantization block size; its separate run
+passed 1 case. Final complete rerun (`p4-final.log`) exited **0**:
+
+| Check | Passed | Failed | Skipped |
+| --- | ---: | ---: | ---: |
+| Runtime / registry / runner CPU and mock contracts | 83 | 0 | 0 |
+| Explicit 910B forward and error-contract matrix | 54 | 0 | 0 |
+| Strict inventory runner: GDN2 accuracy | 9 | 0 | 83 |
+| Strict inventory runner: Sage accuracy | 7 | 0 | 0 |
+
+Runner tests repeat some matrix cases; do not sum these rows as unique tests.
+Its performance status is **SKIPPED**, not PASS. Those 83 GDN2 skips are CUDA
+native/TLE resource comparisons, not skipped Ascend recurrence cases.
+
+| Forward matrix component | Cases | Coverage boundary |
+| --- | ---: | --- |
+| GDN2 | 9 | FP16/BF16, T16/33, nonzero initial/final state, both layouts, invalid chunk size |
+| GLA | 16 | FP16/BF16, T17/32, both layouts, zero/nonzero initial state, output/final state |
+| KDA | 3 | BF16 T16/33 recurrence/final state, public rejection of precomputed indices |
+| MiniMax | 2 | Prefill + score/top-k composite reference; invalid stage |
+| Sage | 8 | HND/NHD, GQA, bool/additive mask, tails, quantization/LSE, aliases, error guards |
+| NSA compression | 10 | Public facade/namespace, FP16/BF16 T64/128, output/LSE, no-grad |
+| NSA selected | 6 | INTERNAL API only; grouped/masked, packed/boundary/empty/invalid indices, output/LSE |
+
+All backward: **OUT OF SCOPE**, original code/tests retained. MiniMax decode,
+full public NSA and independent all-shape primitive validation: **NOT RUN**;
+no claim of independent optimized Ascend decode/full NSA support.
+
+Reproduction: use the explicit nodes in the execution plan, replacing the
+Sage file with its three `test_forward_*` nodes, and adding:
+
+```sh
+python -m pytest -q \
+  tests/flag_attn/test_ascend_nsa_forward.py::test_ascend_nsa_compression_public_alias \
+  tests/flag_attn/test_ascend_nsa_forward.py::test_ascend_nsa_selected_forward \
+  tests/flag_attn/test_ascend_attention.py::test_kda_public_rejects_precomputed_chunk_indices \
+  tests/flag_attn/test_ascend_attention.py::test_minimax_rejects_unknown_stage \
+  tests/flag_attn/test_ascend_attention.py::test_sage_public_forward_alias_and_quantization_error \
+  --disable-warnings
+python tools/run_tests.py --ops chunk_gdn2,sage_attention \
+  --skip-benchmarks --strict-results --gpus 4 --dump-output --color never \
+  --output-dir /tmp/flagattention-ascend-acceptance-20261017/runner
+```
+
+The existing runner interprets `--gpus` as child physical masks; `--gpus 4`
+keeps its workers on physical 4, a subset of the existing parent mask `4,5`.
+Direct tests use logical device 0 in that unchanged parent mask. Global mask
+and runner device-selection implementation are not changed.
+
+Final `compileall`, `git diff --check`, pinned Ruff on changed Python files,
+and applicable source pre-commit hooks pass (`p4-hooks.log`); unmatched hooks
+are Skipped. AST audit still reports **45 unchanged JIT functions**.

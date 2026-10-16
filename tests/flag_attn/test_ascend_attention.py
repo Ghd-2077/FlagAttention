@@ -184,3 +184,40 @@ def test_minimax_prefill_stage_and_index():
         probability = (q[token, 0].cpu().float() @ cache[:, :64].T / 8).softmax(-1)
         expected.append(probability @ cache[:, 64:])
     assert_relative(output, torch.stack(expected)[:, None], limit=0.01)
+
+
+@pytest.mark.minimax_m3_sparse_attn
+def test_minimax_rejects_unknown_stage():
+    from flag_attn import minimax_m3_sparse_attn
+
+    with pytest.raises(ValueError, match="Unsupported MiniMax stage"):
+        minimax_m3_sparse_attn(stage="unsupported")
+
+
+@pytest.mark.chunk_kda
+@torch.inference_mode()
+def test_kda_public_rejects_precomputed_chunk_indices():
+    from flag_attn import chunk_kda
+
+    x = torch.zeros(1, 16, 1, 64, device=backend.device, dtype=torch.bfloat16)
+    with pytest.raises(NotImplementedError, match="chunk_indices"):
+        chunk_kda(x, x, x, x, x[..., 0], chunk_indices=object())
+
+
+@pytest.mark.sage_attention
+@torch.inference_mode()
+def test_sage_public_forward_alias_and_quantization_error():
+    from flag_attn import sage_attention
+    from flag_attn.sage_attention import forward, per_block_int8
+
+    assert forward is sage_attention
+    q = torch.zeros(1, 1, 128, 64, device=backend.device, dtype=torch.int8)
+    v = torch.ones_like(q, dtype=torch.float16)
+    q_scale = torch.ones(1, 1, 1, device=backend.device)
+    k_scale = torch.ones(1, 1, 2, device=backend.device)
+    for implementation in (sage_attention, forward):
+        output, lse = implementation(q, q, v, q_scale, k_scale, return_lse=True)
+        torch.testing.assert_close(output, v, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(lse, torch.full_like(lse, 7), atol=2e-2, rtol=2e-2)
+    with pytest.raises(ValueError, match="positive"):
+        per_block_int8(v, v, BLKQ=0)
