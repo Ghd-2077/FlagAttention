@@ -101,10 +101,10 @@ ancestor; accepting its upstream rename does not drop fork-specific changes.
 | --- | --- | --- |
 | GDN2 | Inference only, BT=16 | Registered through `gdn2/api.py`, exact public parameter order; differentiable calls fail explicitly; original internal entry preserved |
 | Sage | Public forward aliases and shared quantization; existing masked framework path | Registered with upstream aliases, fork mask/maxnreg behavior preserved |
-| GLA | Same parameters/defaults, output/final state, variable length and backward | Registered to `gla.chunk_gla`; NPU regressions in P3 |
+| GLA | Same parameters/defaults, output/final state, variable length and backward | Registered to `gla.chunk_gla`; BLOCKED in P3: existing shared state kernel has no Ascend tuning entries (BK/BV) |
 | KDA | Registry key `chunk_kda_fwd_infer`; Ascend wrapper has distinct defaults/options | Registered through matching inference signature, preserves `safe_gate=False` default; rejects precomputed chunk_indices explicitly |
 | NSA selected | Returns output/LSE, lacks full backward API | Keep internal; do not register as full `parallel_nsa` |
-| NSA compression | Same q/k/v/block_size/scale/cu_seqlens and output/LSE; backward supported | Registered to `nsa.compression`; NPU regressions in P3 |
+| NSA compression | Matching signature/output but backward is unreliable in the full regression suite | Intentionally NOT registered after P3 evidence; original internal implementation is retained. See failures below |
 | MiniMax | Prefill and four index primitives match parameter/default/return contracts | Registered prefill and index primitives; decode attention intentionally not registered because fork simply reexports Generic; no independent Ascend decode implementation |
 | ops | Internal shared primitives without public generic contracts | Keep internal |
 
@@ -128,4 +128,140 @@ ancestor; accepting its upstream rename does not drop fork-specific changes.
   inference guards and internal primitive isolation tested with CPU tensors/mocks.
   Runtime + runner + registry: **52 passed**, exit 0, `/tmp/migration-p2-tests.log`.
   These results do not establish NPU mathematical correctness.
-- P3-P4: not yet performed.
+- P3: **NOT PASSED**. See acceptance evidence below. Work is checkpointed for
+  review, not declared complete. P4 acceptance has not started because P3 is red.
+
+## P3 evidence and remaining blockers
+
+### Changes
+
+- Added `tests/flag_attn/test_ascend_attention.py` using public APIs and independent
+  CPU references. Tests cover GDN2 FP16/BF16, lengths 16/33, nonzero initial
+  state, both state layouts, shape/dtype, invalid BT; GLA output/state/gradients;
+  KDA recurrence and MiniMax stage-facade/index/prefill.
+- CUDA native/TLE GDN2 comparison tests are explicitly skipped on Ascend,
+  alongside separately executed NPU recurrence tests; skipped is not passed.
+- Extended existing inventory entries, without creating a second dispatcher.
+- Added inventory-path scoping to the existing runner so unrelated optional
+  modules are not eagerly imported. Added `--skip-benchmarks` with an explicit
+  `Skipped` performance result (the locked upstream did not accept this flag).
+- Added matching runner regressions. Initial environment import required
+  `distro==1.9.0`, installed only in `/tmp/flagattention-migration-deps`.
+- GDN2 V-first initial-state recurrence failed at relative RMS 0.0256607;
+  reproduced the exact error using the original fork implementation. Adapted
+  public V/K states to K/V before calling the unchanged kernel and transposed
+  final/intermediate states back. The internal kernel/API remains preserved.
+- NSA compression was initially registered, then withdrawn after a reproducible
+  full-suite backward failure. Its internal kernels remain intact.
+
+### Commands and results
+
+All NPU tests use physical device 4 in `ghd-sageattn`; source checkout used
+`/data/ghd/pr/flagattention-ascend-migration-20261016`. Validation source was
+transferred from the local migration branch; original `npu-ghd` is untouched.
+
+```sh
+export ASCEND_RT_VISIBLE_DEVICES=4 FLAG_ATTN_BACKEND=ascend PYTHONPATH=src:.
+/usr/local/python3.11.15/bin/python -m pytest -q \
+  tests/flag_attn/test_runtime.py tests/flag_attn/test_test_runner.py \
+  tests/flag_attn/test_ascend_registry.py --disable-warnings
+```
+
+Result before final registry withdrawal: **54 passed**, `/tmp/migration-p3-host-tests.log`
+on the host. Final registry withdrawal rerun: **53 passed**, exit 0,
+host `/tmp/migration-final-host-tests.log`.
+
+```sh
+PATH=/usr/local/python3.11.15/bin:$PATH \
+PYTHONPATH=src:.:/tmp/flagattention-migration-deps \
+/usr/local/python3.11.15/bin/python tools/run_tests.py \
+  --ops chunk_gdn2,sage_attention --skip-benchmarks --dump-output \
+  --gpus 0 --output-dir /tmp/migration-p3-runner-cann --color never
+```
+
+Result: GDN2 **9 passed / 83 skipped**, Sage **7 passed**, both accuracy entries
+**Passed**; performance entries **Skipped**.
+Read JSON per-operator statuses: upstream runner can return shell exit 0 even
+when an operator fails. CUDA-only GDN2 comparisons (83 cases) remain skipped.
+Runner logs and JSON are in the container at `/tmp/migration-p3-runner-cann/`.
+The first runner attempt failed to import `distro`; the next rejected the
+missing CLI flag; a later run lost the CANN compiler from a manually overridden
+PATH. None of these failed runs is counted as a pass. The command above retains
+CANN PATH and is the successful execution.
+
+```sh
+/usr/local/python3.11.15/bin/python -m pytest -q \
+  tests/flag_attn/test_ascend_attention.py --disable-warnings
+```
+
+Result after GDN2 layout adapter: **12 passed, 2 failed**. Failures are GLA
+lengths 17/32: `dynamic_func() missing ... BK and BV`. Both old and new
+`runtime.get_tuned_config('chunk_fwd_kernel_h')` return `[]`, and neither
+checkout contains `_ascend/tune_configs.yaml`. Supplying new launch/tile
+configuration is outside this task's explicit no-tuning constraint. Host log:
+`/tmp/migration-p3-ascend-rerun-host.log`. This is a configuration BLOCKED
+condition backed by real test failures, not a missing-hardware skip.
+
+```sh
+/usr/local/python3.11.15/bin/python -m pytest -q \
+  tests/flag_attn/test_sage_attention.py \
+  tests/flag_attn/test_parallel_nsa_compression.py --disable-warnings
+```
+
+Initial result: **14 passed, 1 failed**; complete rerun: **13 passed, 2 failed**.
+NSA compression backward at T128/T256 has nonfinite gradients in the full suite;
+the T128 case passed in isolation on old and new sources, and passed three
+additional isolated runs. Cause is not established; do not label it a migration
+math regression or claim stable correctness. Container logs:
+`/tmp/migration-public-existing{,-rerun}.log`,
+`/tmp/migration-{old-compression,new-compression-rerun}.log`,
+`/tmp/migration-nsa-repeat-{1,2,3}.log`.
+
+Direct project benchmark functions were invoked through `runpy.run_path`, since
+the upstream modules have pytest entry points and no script `__main__`:
+
+```python
+import runpy
+runpy.run_path('benchmark/test_gdn2_benchmark.py')['run_benchmark'](
+    ['--shape', '1,128,1,64,64', '--warmup', '5', '--rep', '20'])
+m = runpy.run_path('benchmark/test_sage_attention_benchmark.py')
+m['benchmark'](m['parse_args']([
+    '--batch-size', '1', '--num-heads', '2', '--head-dim', '64',
+    '--seq-lens', '128', '256', '--warmup', '5', '--rep', '20', '--dtype', 'float16']))
+```
+
+GDN2 BF16 public API: **0.715145 ms** (NPU event timing, no native CUDA baseline).
+Sage FP16 T128/T256: **0.318420 / 0.321860 ms**; cosine
+**0.999930 / 0.999925**, relative L2 **0.011816 / 0.012276**, within the upstream
+benchmark's thresholds. SDPA speedups on these small cases are **0.419 / 0.410**,
+so these cases are slower than SDPA. Host logs:
+`/tmp/migration-{gdn,sage}-bench-host.log`. These use a different timing protocol
+from P0 and must NOT be compared directly to P0 or called no-regression proof.
+
+### Static checks and limitations
+
+- `compileall` and `git diff --check` passed.
+- Structural AST comparison of all **43** existing Ascend JIT functions against
+  `cc675a5` found **zero changed kernels**.
+- Ruff passes for the new adapters/tests, backend export table and modified
+  GDN2/runner tests. Full runner-file Ruff reports **35** pre-existing findings;
+  running the same checker on locked upstream produced the same **35**
+  code/message pairs: **zero new findings**. They are not fixed through
+  unrelated cleanup.
+- Repository pre-commit execution is **BLOCKED** while fetching hook repos:
+  the configured global Git proxy at `127.0.0.1:7890` is unreachable. Did not
+  alter global Git settings or disable hooks to claim success.
+- GitHub CI runner/container permissions and actual self-hosted workflow run
+  are **BLOCKED / not verified**; the locked 910B CI config was inherited intact.
+- P4 before/after performance acceptance and complete migration sign-off remain
+  **PENDING** until GLA config and NSA backward stability are resolved.
+
+## Next scoped work
+
+1. Provide previously validated Ascend state-kernel tuning metadata, or explicitly
+   authorize restoring the missing launch configuration. Do not invent/tune it
+   under the current task constraints.
+2. Diagnose compression backward full-suite/isolated discrepancy on an independent
+   fix branch; preserve the unregistered implementation here.
+3. Rerun P3, then perform P4 same-protocol before/after comparisons and final CI
+   acceptance. No performance optimization or remote push has been performed.

@@ -28,7 +28,7 @@ def clear_registry():
 
 @pytest.mark.parametrize("name", [
     "chunk_gdn2", "chunk_gla", "chunk_kda_fwd_infer",
-    "parallel_nsa_compression", "sage_attention",
+    "sage_attention",
     "minimax_m3_sparse_attn", "minimax_m3_index_topk",
 ])
 def test_ascend_declared_override_resolves_without_generic(monkeypatch, name):
@@ -45,6 +45,7 @@ def test_undeclared_operators_use_generic(monkeypatch):
     module.parallel_nsa = Mock()
     monkeypatch.setitem(sys.modules, module.__name__, module)
     assert "parallel_nsa" not in op_registry._backend_exports("ascend")
+    assert "parallel_nsa_compression" not in op_registry._backend_exports("ascend")
     assert "minimax_m3_sparse_attn_decode" not in op_registry._backend_exports("ascend")
     assert op_registry.resolve_operator("parallel_nsa", module.__name__, vendor="ascend") is module.parallel_nsa
 
@@ -89,12 +90,16 @@ def test_gdn2_adapter_preserves_options(monkeypatch):
 
     module_name = "flag_attn.runtime.backend._ascend.gdn2.chunk_fwd_infer"
     module = ModuleType(module_name)
-    module.chunk_gdn2_fwd_infer = Mock(return_value=("output", "state", "history"))
+    state = torch.arange(6).reshape(1, 1, 2, 3)
+    history = state.unsqueeze(1)
+    module.chunk_gdn2_fwd_infer = Mock(return_value=("output", state, history))
     monkeypatch.setitem(sys.modules, module_name, module)
     with torch.no_grad():
         result = chunk_gdn2(1, 2, 3, 4, 5, 6, state_v_first=True, return_intermediate_states=True)
-    assert result == ("output", "state", "history")
-    assert module.chunk_gdn2_fwd_infer.call_args.kwargs["state_v_first"] is True
+    assert result[0] == "output"
+    torch.testing.assert_close(result[1], state.transpose(-1, -2))
+    torch.testing.assert_close(result[2], history.transpose(-1, -2))
+    assert module.chunk_gdn2_fwd_infer.call_args.kwargs["state_v_first"] is False
     assert module.chunk_gdn2_fwd_infer.call_args.kwargs["return_intermediate_states"] is True
 
 
