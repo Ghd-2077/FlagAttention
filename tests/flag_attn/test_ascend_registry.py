@@ -115,3 +115,14 @@ def test_kda_rejects_training_and_unsupported_chunk_indices():
 def test_shared_primitives_are_not_public_overrides():
     exports = op_registry._backend_exports("ascend")
     assert not {"chunk_local_cumsum", "mean_pooling", "parallel_attn_bwd_preprocess"} & exports.keys()
+
+def test_ascend_forward_state_config_is_loadable():
+    from flag_attn.runtime.configs_loader import TunedConfigLoader
+
+    configs = TunedConfigLoader("ascend").get_tuned_config("chunk_fwd_kernel_h")
+    assert configs, "Ascend forward state kernel requires explicit BK/BV configs"
+    for config in configs:
+        assert config.kwargs["BK"] in (32, 64)
+        assert config.kwargs["BV"] in (32, 64)
+        assert config.num_warps in (1, 2, 4, 8)
+        assert config.num_stages > 0

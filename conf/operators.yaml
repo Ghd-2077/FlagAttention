@@ -111,7 +111,7 @@ ops:
       - tests/flag_attn/test_chunk_gla.py::test_chunk
       - tests/flag_attn/test_chunk_gla.py::test_chunk_state_v_first
       - tests/flag_attn/test_chunk_gla.py::test_chunk_varlen
-      - tests/flag_attn/test_ascend_attention.py::test_gla_forward_and_backward
+      - tests/flag_attn/test_ascend_attention.py::test_gla_forward
     benchmark: benchmark/test_chunk_gla_benchmark.py
   - id: chunk_kda
     description: Run Kimi Delta Attention inference on the selected backend against its recurrent reference.

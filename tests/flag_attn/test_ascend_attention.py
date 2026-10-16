@@ -68,7 +68,38 @@ def test_gdn2_rejects_unsupported_chunk_size():
 
 @pytest.mark.chunk_gla
 @pytest.mark.parametrize("length", [17, 32])
-def test_gla_forward_and_backward(length):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("state_v_first", [False, True])
+@pytest.mark.parametrize("with_initial_state", [False, True])
+@torch.inference_mode()
+def test_gla_forward(length, dtype, state_v_first, with_initial_state):
+    from flag_attn import chunk_gla
+
+    torch.manual_seed(43)
+    shape = (1, length, 1, 32)
+    hosts = [torch.randn(shape).to(dtype) / 8 for _ in range(3)]
+    hosts.append(-torch.rand(shape).to(dtype) * 0.1)
+    state = torch.randn(1, 1, 32, 32) * 0.01 if with_initial_state else torch.zeros(1, 1, 32, 32)
+    initial = state.transpose(-1, -2).contiguous() if state_v_first else state.clone()
+    output, final = chunk_gla(
+        *[x.to(backend.device) for x in hosts], output_final_state=True,
+        initial_state=initial.to(backend.device) if with_initial_state else None,
+        state_v_first=state_v_first,
+    )
+    q, k, v, g = [x.float() for x in hosts]
+    expected = []
+    for token in range(length):
+        state = state * g[:, token].exp().unsqueeze(-1)
+        state = state + k[:, token].unsqueeze(-1) * v[:, token].unsqueeze(-2)
+        expected.append(torch.einsum("bhk,bhkv->bhv", q[:, token] / (32 ** 0.5), state))
+    assert output.dtype == dtype
+    assert_relative(output, torch.stack(expected, 1))
+    assert_relative(final.transpose(-1, -2) if state_v_first else final, state)
+
+
+@pytest.mark.chunk_gla
+@pytest.mark.parametrize("length", [17, 32])
+def test_gla_backward(length):
     from flag_attn import chunk_gla
 
     torch.manual_seed(43)

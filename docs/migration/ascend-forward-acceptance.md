@@ -34,7 +34,7 @@ from the existing toolkit without replacing its compiler PATH.
 | Stage | State | Evidence |
 | --- | --- | --- |
 | P0 audit | PASS | Clean baseline, isolated branch, fresh NPU detection |
-| P1 GLA forward | NOT RUN | No current test results |
+| P1 GLA forward | PASS | 17 passed, exit 0, real 910B |
 | P2 NSA forward | NOT RUN | No current test results |
 | P3 strict runner | NOT RUN | No current test results |
 | P4 NPU regression | NOT RUN | Historical logs do not count |
@@ -47,3 +47,38 @@ Ascend implementations/exports, configuration inventory, migration docs,
 Ascend tests and the runner. P1 will add an Ascend YAML and split its own GLA
 test; P2 will change only a new adapter/exports/tests; P3 only runner/tests.
 Existing JIT source is outside the implementation boundary.
+
+## P1 — GLA configuration and separate forward gate
+
+The new CPU-capable configuration test was executed before adding YAML:
+**1 failed**, exit 1, because the loader returned `[]` (log `p1-red.log`).
+The original projects and Git history contain no Ascend YAML for this kernel.
+The single candidate is copied from the locked NVIDIA example: BK=32, BV=32,
+num_warps=4, num_stages=3. It is a correctness restoration candidate, not a
+performance tuning result. No backward configuration is invented.
+
+`test_gla_forward` covers lengths 17/32, FP16/BF16, both state layouts, with
+and without a nonzero initial state, using the existing 0.01 relative-RMS
+threshold and an independent CPU recurrence. Existing gradient assertions
+remain in `test_gla_backward`, outside the forward gate. The inventory node
+now points to the new forward test; official cross-vendor tests remain intact.
+
+Command (from the isolated checkout, existing CANN environment and device mask):
+
+```sh
+python -m pytest -q \
+  tests/flag_attn/test_ascend_attention.py::test_gla_forward \
+  tests/flag_attn/test_ascend_registry.py::test_ascend_forward_state_config_is_loadable \
+  --disable-warnings
+```
+
+Hardware result: **17 passed, 2 warnings**, exit **0**, 1682.24 seconds on
+910B (16 numerical cases plus the configuration check). The lengthy first run
+compiled the existing autotune candidates unchanged. The candidate is now
+validated for this matrix, not claimed optimal. Backward: OUT OF SCOPE.
+Logs: `/tmp/flagattention-ascend-acceptance-20261017/p1-green.log`.
+Pre-commit on the new YAML passed all applicable hooks; unmatched hooks skipped.
+Standalone Ruff on both modified test files passed.
+Static `compileall` and `git diff --check` pass. AST comparison with the baseline
+covers **45 JIT functions** (43 Ascend plus 2 shared state functions): zero
+changed function ASTs. CPU/mock checks are not hardware correctness evidence.
