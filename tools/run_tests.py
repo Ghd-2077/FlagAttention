@@ -870,6 +870,15 @@ def op_marker(op):
     return stripped
 
 
+def inventory_targets(op, kind):
+    """Collect only declared files, so unrelated optional kernels stay lazy."""
+    entry = next((item for item in get_ops_from_inventory() if item["id"] == op), {})
+    paths = entry.get(kind, [])
+    if isinstance(paths, str):
+        paths = [paths]
+    return " ".join(shlex.quote(str(ROOT / path)) for path in paths)
+
+
 def run_accuracy_q(gpu_id, op):
     """Run accuracy test for one op. Returns result dict."""
     env = get_env(str(gpu_id))
@@ -879,6 +888,9 @@ def run_accuracy_q(gpu_id, op):
     if CFG.quick:
         base += " --quick"
     cmd = base + " --continue-on-collection-errors -vs"
+    targets = inventory_targets(op, "tests")
+    if targets:
+        cmd += " " + targets
 
     accuracy_dir = ROOT.joinpath("tests")
     result_file = accuracy_dir / f"accuracy_{op}.json"
@@ -930,6 +942,8 @@ def run_accuracy_q(gpu_id, op):
 
 def run_benchmark_q(gpu_id, op):
     """Run benchmark for one op. Returns result dict."""
+    if getattr(CFG, "skip_benchmarks", False):
+        return {"status": "Skipped", "exit_code": 0, "duration": 0, "data": {}}
     env = get_env(str(gpu_id))
 
     benchmark_dir = ROOT / "benchmark"
@@ -946,6 +960,9 @@ def run_benchmark_q(gpu_id, op):
         f'pytest -m "{marker}" --level core --record json '
         f"--output benchmark_{op}.json --continue-on-collection-errors"
     )
+    targets = inventory_targets(op, "benchmark")
+    if targets:
+        cmd += " " + targets
     code = run_cmd(op, cmd, cwd=benchmark_dir, env=env, flavor="performance")
     dur = time.time() - dur
 
@@ -1468,6 +1485,11 @@ def main():
         help="Save each test's stdout/stderr to log files (default: discard)",
     )
     parser.add_argument(
+        "--skip-benchmarks",
+        action="store_true",
+        help="Run accuracy only; report benchmark status as Skipped",
+    )
+    parser.add_argument(
         "--quick",
         action="store_true",
         default=False,
@@ -1482,6 +1504,7 @@ def main():
     OPTS = parser.parse_args()
     CFG.dump_output = OPTS.dump_output
     CFG.quick = OPTS.quick
+    CFG.skip_benchmarks = OPTS.skip_benchmarks
     CFG.start = OPTS.start
 
     # Apply color mode (IS_TTY controls cursor-based footer, USE_COLORS controls ANSI colors)

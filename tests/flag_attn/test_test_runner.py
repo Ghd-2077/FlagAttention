@@ -308,3 +308,28 @@ def test_runner_commands_and_summary_processing_match_shared_flow(
     assert performance["data"]["fp16"]["details"]["[1]"]["speedup"] == 2.0
     assert (runner.CFG.output_dir / "sample" / "accuracy_result.json").exists()
     assert (runner.CFG.output_dir / "sample" / "performance_result.json").exists()
+
+
+def test_inventory_targets_preserve_explicit_test_nodes(monkeypatch, tmp_path, runner):
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    monkeypatch.setattr(runner, "get_ops_from_inventory", lambda: [{
+        "id": "sample",
+        "tests": ["tests/test_sample.py::test_boundary"],
+        "benchmark": "benchmark/test_sample.py",
+    }])
+    import shlex
+
+    assert shlex.split(runner.inventory_targets("sample", "tests")) == [
+        str(tmp_path / "tests/test_sample.py::test_boundary")
+    ]
+    assert shlex.split(runner.inventory_targets("sample", "benchmark")) == [
+        str(tmp_path / "benchmark/test_sample.py")
+    ]
+    assert runner.inventory_targets("unknown", "tests") == ""
+
+
+def test_accuracy_only_reports_benchmark_skipped(monkeypatch, runner):
+    monkeypatch.setattr(runner.CFG, "skip_benchmarks", True, raising=False)
+    assert runner.run_benchmark_q(0, "sample") == {
+        "status": "Skipped", "exit_code": 0, "duration": 0, "data": {},
+    }
