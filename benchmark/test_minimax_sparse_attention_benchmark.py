@@ -21,8 +21,10 @@ with scalar K/V dequantization scales passed to both implementations.
 
 from __future__ import annotations
 
+
 import ast
 import inspect
+import math
 import sys
 import textwrap
 import warnings
@@ -36,20 +38,24 @@ import triton.knobs
 import triton.testing as triton_testing
 
 try:
-    from benchmark.recording import benchmark_metric, record_benchmark_result
+    from benchmark.recording import BenchmarkRecorder
 except ModuleNotFoundError:  # Direct script execution.
-    from recording import benchmark_metric, record_benchmark_result
+    from recording import BenchmarkRecorder
 
+from flag_attn.testing import backend as test_backend
+from flag_attn import minimax_m3_sparse_attn
 from flag_attn.minimax_sparse_attention import (
     SPARSE_BLOCK_SIZE,
     minimax_m3_index_decode,
     minimax_m3_index_score,
     minimax_m3_index_topk,
-    minimax_m3_sparse_attn,
-    minimax_m3_sparse_attn_decode,
 )
+from flag_attn.minimax_sparse_attention import minimax_m3_sparse_attn_decode
+from functools import partial
 
 try:
+    if not test_backend.is_nvidia():
+        raise ImportError("CUDA comparison is unavailable on the selected backend")
     from vllm.models.minimax_m3.common.ops.index_topk import (
         minimax_m3_index_decode as vllm_index_decode,
     )
@@ -112,6 +118,7 @@ DEFAULT_REP = 300
 KV_SCALE = 0.5
 BF16_ATOL = BF16_RTOL = 2e-2
 FP8_ATOL, FP8_RTOL = 6e-2, 8e-2
+OUTPUT_CHECK_CHUNK_ELEMENTS = 1 << 20
 
 PREFILL_SHAPES = [
     (1, 8192, 16, 96),
@@ -170,15 +177,15 @@ class MSAData:
 
 
 def _require_cuda() -> None:
-    if not torch.cuda.is_available():
-        raise RuntimeError("This benchmark requires CUDA.")
+    if not (test_backend.supports_operator("minimax_m3_sparse_attn") or test_backend.supports_operator("minimax_m3_sparse_attn_decode")):
+        raise RuntimeError("This benchmark requires an available accelerator.")
 
 
 def _supports_fp8() -> bool:
-    if FP8_DTYPE is None or not torch.cuda.is_available():
+    if FP8_DTYPE is None or not (test_backend.supports_operator("minimax_m3_sparse_attn") or test_backend.supports_operator("minimax_m3_sparse_attn_decode")):
         return False
     # NVIDIA FP8 Tensor Core support starts with Ada (8.9) and Hopper (9.0).
-    return torch.cuda.get_device_capability() >= (8, 9)
+    return not test_backend.is_nvidia() or test_backend.cuda_capability() >= (8, 9)
 
 
 def _encode_fp8(value: torch.Tensor, scale: float) -> torch.Tensor:
@@ -447,9 +454,9 @@ def run_decode(
 def bench_fn(fn: Callable, warmup: int, rep: int) -> float:
     for _ in range(3):
         fn()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
     return float(
-        triton_testing.do_bench(fn, warmup=warmup, rep=rep, return_mode="median")
+        test_backend.do_bench(fn, warmup=warmup, rep=rep, return_mode="median")
     )
 
 
@@ -554,33 +561,72 @@ def _check_outputs(
     layout: str,
 ) -> float:
     context = f"{mode}, {dtype_name}, shape={shape}, vLLM layout={layout}"
-    for provider, output in (("FlagAttention", flag_output), ("vLLM", vllm_output)):
-        if not torch.isfinite(output).all().item():
-            raise AssertionError(f"{provider} produced NaN or Inf ({context})")
+    # Keep the benchmark outputs on GPU, but do the accuracy work on CPU. A
+    # full-size GPU assert_close can need several times the output's size in
+    # temporary tensors, even when the two outputs match.
+    flag_cpu = flag_output.detach().cpu()
+    vllm_cpu = vllm_output.detach().cpu()
+    for provider, output in (("FlagAttention", flag_cpu), ("vLLM", vllm_cpu)):
+        for chunk in output.reshape(-1).split(OUTPUT_CHECK_CHUNK_ELEMENTS):
+            if not torch.isfinite(chunk).all().item():
+                raise AssertionError(f"{provider} produced NaN or Inf ({context})")
 
     atol, rtol = (
         (FP8_ATOL, FP8_RTOL) if dtype_name == "fp8" else (BF16_ATOL, BF16_RTOL)
     )
-    try:
-        torch.testing.assert_close(flag_output, vllm_output, atol=atol, rtol=rtol)
-    except AssertionError as exc:
-        diff = (flag_output.float() - vllm_output.float()).abs()
+    if (
+        flag_output.shape != vllm_output.shape
+        or flag_output.dtype != vllm_output.dtype
+        or flag_output.device != vllm_output.device
+        or flag_output.layout != vllm_output.layout
+    ):
         raise AssertionError(
             f"FlagAttention/vLLM output mismatch ({context}); "
-            f"max_abs_diff={diff.max().item():.6g}, atol={atol}, rtol={rtol}"
+            f"metadata differs: shape={tuple(flag_output.shape)}/{tuple(vllm_output.shape)}, "
+            f"dtype={flag_output.dtype}/{vllm_output.dtype}, "
+            f"device={flag_output.device}/{vllm_output.device}, "
+            f"layout={flag_output.layout}/{vllm_output.layout}"
+        )
+
+    flag_flat = flag_cpu.reshape(-1)
+    vllm_flat = vllm_cpu.reshape(-1)
+    try:
+        for flag_chunk, vllm_chunk in zip(
+            flag_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+            vllm_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+        ):
+            torch.testing.assert_close(flag_chunk, vllm_chunk, atol=atol, rtol=rtol)
+    except AssertionError as exc:
+        max_abs_diff = 0.0
+        for flag_chunk, vllm_chunk in zip(
+            flag_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+            vllm_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+        ):
+            if flag_chunk.numel():
+                diff = (flag_chunk.float() - vllm_chunk.float()).abs()
+                max_abs_diff = max(max_abs_diff, diff.max().item())
+        raise AssertionError(
+            f"FlagAttention/vLLM output mismatch ({context}); "
+            f"max_abs_diff={max_abs_diff:.6g}, atol={atol}, rtol={rtol}"
         ) from exc
 
-    flag_flat = flag_output.float().flatten()
-    vllm_flat = vllm_output.float().flatten()
-    flag_norm = torch.linalg.vector_norm(flag_flat)
-    vllm_norm = torch.linalg.vector_norm(vllm_flat)
-    cosine = torch.where(
-        (flag_norm == 0) & (vllm_norm == 0),
-        torch.ones_like(flag_norm),
-        torch.dot(flag_flat, vllm_flat)
-        / (flag_norm * vllm_norm).clamp_min(torch.finfo(torch.float32).tiny),
+    dot = flag_norm_sq = vllm_norm_sq = 0.0
+    for flag_chunk, vllm_chunk in zip(
+        flag_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+        vllm_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
+    ):
+        flag_values = flag_chunk.float().double()
+        vllm_values = vllm_chunk.float().double()
+        dot += torch.dot(flag_values, vllm_values).item()
+        flag_norm_sq += torch.dot(flag_values, flag_values).item()
+        vllm_norm_sq += torch.dot(vllm_values, vllm_values).item()
+    if flag_norm_sq == 0 and vllm_norm_sq == 0:
+        return 1.0
+    denominator = max(
+        math.sqrt(flag_norm_sq) * math.sqrt(vllm_norm_sq),
+        torch.finfo(torch.float32).tiny,
     )
-    return cosine.clamp(-1.0, 1.0).item()
+    return max(-1.0, min(1.0, dot / denominator))
 
 
 def _bench_steps(
@@ -612,7 +658,7 @@ def _bench_steps(
 
         def attention() -> None:
             _call_sparse(
-                minimax_m3_sparse_attn_decode,
+                partial(minimax_m3_sparse_attn, stage="decode"),
                 data,
                 topk_idx,
                 output,
@@ -623,7 +669,7 @@ def _bench_steps(
             )
 
         attention()
-        torch.cuda.synchronize()
+        test_backend.device_fn.synchronize()
         return {
             "index_decode": bench_fn(index_decode, args.warmup, args.rep),
             "attention_decode": bench_fn(attention, args.warmup, args.rep),
@@ -675,7 +721,7 @@ def _bench_steps(
     index_score()
     index_topk()
     attention()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
     return {
         "index_score": bench_fn(index_score, args.warmup, args.rep),
         "index_topk": bench_fn(index_topk, args.warmup, args.rep),
@@ -756,8 +802,17 @@ def _run_dtype(
     print(_format_columns(headers))
     print(separator)
 
-    device = torch.device("cuda")
-    metrics = []
+    device = torch.device(test_backend.device)
+    recorder = BenchmarkRecorder(
+        record_property,
+        op_name="minimax_m3_sparse_attn",
+        dtype=str(torch.bfloat16 if dtype_name == "bf16" else FP8_DTYPE),
+        baseline="vLLM" if run_vllm else None,
+        vllm_kv_layout=vllm_layout,
+        phase="decode" if args.decode else "prefill",
+        topk=args.topk,
+        decode_qlen=args.decode_qlen if args.decode else None,
+    )
     for shape_index, shape in enumerate(_get_shapes(args)):
         batch, seq_len, num_kv_heads, num_heads = shape
         if num_heads % num_kv_heads != 0:
@@ -792,7 +847,7 @@ def _run_dtype(
             if args.decode:
                 run_decode(
                     minimax_m3_index_decode,
-                    minimax_m3_sparse_attn_decode,
+                    partial(minimax_m3_sparse_attn, stage="decode"),
                     data,
                     seq_len,
                     num_kv_heads,
@@ -851,7 +906,7 @@ def _run_dtype(
         if run_vllm:
             flag_attn_run()
             vllm_run()
-            torch.cuda.synchronize()
+            test_backend.device_fn.synchronize()
             assert vllm_output is not None and vllm_layout is not None
             accuracy = _check_outputs(
                 flag_attn_output,
@@ -906,32 +961,22 @@ def _run_dtype(
                 )
         print(_format_columns(row))
         sys.stdout.flush()
-        metrics.append(
-            benchmark_metric(
-                shape_detail=shape,
-                latency_base=vllm_ms,
-                latency=flag_attn_ms,
-                speedup=(
-                    vllm_ms / flag_attn_ms
-                    if vllm_ms is not None and flag_attn_ms > 0
-                    else None
-                ),
-                accuracy=accuracy,
-                steps=steps,
-            )
+        recorder.add(
+            shape_detail=shape,
+            latency_base=vllm_ms,
+            latency=flag_attn_ms,
+            accuracy=accuracy,
+            steps=steps,
         )
 
-    record_benchmark_result(
-        record_property,
-        op_name="minimax_m3_sparse_attn",
-        dtype=str(torch.bfloat16 if dtype_name == "bf16" else FP8_DTYPE),
-        result=metrics,
-        baseline="vLLM" if run_vllm else None,
-        vllm_kv_layout=vllm_layout,
-        phase="decode" if args.decode else "prefill",
-        topk=args.topk,
-        decode_qlen=args.decode_qlen if args.decode else None,
-    )
+        # Release this shape before make_data allocates the next one. The
+        # closures and provider tuple also hold references to GPU tensors.
+        if run_vllm:
+            del providers, timings
+        del flag_attn_run, vllm_run, flag_attn_output, vllm_output, vllm_data, data, generator
+        test_backend.device_fn.empty_cache()
+
+    recorder.record()
 
 
 def run_benchmark(
@@ -945,9 +990,9 @@ def run_benchmark(
         raise ValueError("--decode-qlen must be positive")
     if args.warmup < 0 or args.rep <= 0:
         raise ValueError("--warmup must be non-negative and --rep must be positive")
-    capability = torch.cuda.get_device_capability()
+    capability = test_backend.cuda_capability()
     print(
-        f"[device] {torch.cuda.get_device_name()} "
+        f"[device] {test_backend.get_device_name()} "
         f"capability={capability[0]}.{capability[1]}"
     )
     if args.prefill_only:
@@ -981,9 +1026,10 @@ def run_benchmark(
             _run_dtype(args, dtype_name, record_property)
 
 
+# This shared benchmark runs both prefill and decode.
 @pytest.mark.minimax_m3_sparse_attn
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="MiniMax M3 benchmark requires CUDA"
+    not (test_backend.supports_operator("minimax_m3_sparse_attn") or test_backend.supports_operator("minimax_m3_sparse_attn_decode")), reason="requires an available accelerator"
 )
 def test_msa_benchmark(request, record_property) -> None:
     """Run the MSA benchmark through pytest using benchmark CLI timing options."""
@@ -993,7 +1039,3 @@ def test_msa_benchmark(request, record_property) -> None:
         rep=int(request.config.getoption("--iter", default=DEFAULT_REP)),
     )
     run_benchmark(args, record_property)
-
-
-if __name__ == "__main__":
-    run_benchmark(MSABenchmarkArgs())

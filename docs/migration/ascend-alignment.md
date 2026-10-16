@@ -112,4 +112,14 @@ ancestor; accepting its upstream rename does not drop fork-specific changes.
 
 - P0: PASS; audit, backup and migration branches exist; pre-migration accuracy
   and fixed-shape timing captured on 910B; original `npu-ghd` unchanged.
-- P1-P4: not yet performed.
+- P1: PASS. Merged the locked upstream, resolving `.gitignore` by retaining
+  local MLA exclusion and Sage forward by preserving fork mask/maxnreg fixes
+  plus upstream's named grid function. All 15 unique Ascend source files remain.
+  `python -m compileall -q src` passed locally and on the server.
+  Runtime/runner pytest initially had 36 pass / 1 failure: upstream #99 added
+  SDK metadata without updating the environment dictionary assertion. Added
+  a deterministic SDK probe mock/expectation; rerun: **37 passed**, exit 0.
+  Logs: `/tmp/migration-p1-tests{,-rerun}.log` in the container.
+  Local Windows lacks torch/Triton; real imports/tests ran in the existing
+  Ascend container using the isolated migration directory.
+- P2-P4: not yet performed.

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+
 import argparse
 from dataclasses import dataclass
 from typing import Callable
@@ -26,11 +27,13 @@ import torch.nn.functional as F
 import triton
 
 try:
-    from benchmark.recording import benchmark_metric, record_benchmark_result
+    from benchmark.recording import BenchmarkRecorder
 except ModuleNotFoundError:  # Direct script execution.
-    from recording import benchmark_metric, record_benchmark_result
+    from recording import BenchmarkRecorder
 
-from flag_attn.sage_attention import forward, per_block_int8
+from flag_attn.testing import backend as test_backend
+from flag_attn import sage_attention
+from flag_attn.sage_attention import per_block_int8
 
 
 SDPA_BASELINE_NAME = "torch_sdpa"
@@ -92,9 +95,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _make_inputs(shape: tuple[int, int, int, int]):
     torch.manual_seed(42)
-    q = torch.randn(shape, device="cuda", dtype=torch.float16)
-    k = torch.randn(shape, device="cuda", dtype=torch.float16)
-    v = torch.randn(shape, device="cuda", dtype=torch.float16)
+    q = torch.randn(shape, device=test_backend.device, dtype=torch.float16)
+    k = torch.randn(shape, device=test_backend.device, dtype=torch.float16)
+    v = torch.randn(shape, device=test_backend.device, dtype=torch.float16)
     q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k)
     return q, k, v, q_int8, q_scale, k_int8, k_scale
 
@@ -119,7 +122,7 @@ def _run_flagattention(
     output_dtype: torch.dtype,
     maxnreg: int | None,
 ) -> torch.Tensor:
-    output, _ = forward(
+    output, _ = sage_attention(
         q_int8,
         k_int8,
         v,
@@ -175,13 +178,13 @@ def _benchmark_case(
     )
     del baseline_output, flagattention_output
 
-    baseline_ms = triton.testing.do_bench(
+    baseline_ms = test_backend.do_bench(
         lambda: _run_baseline(q, k, v).to(output_dtype),
         warmup=warmup,
         rep=rep,
         return_mode="median",
     )
-    flagattention_ms = triton.testing.do_bench(
+    flagattention_ms = test_backend.do_bench(
         lambda: _run_flagattention(
             q_int8,
             k_int8,
@@ -288,7 +291,14 @@ def _run_benchmark_cases(
 
     _print_header(output_dtype, warmup, rep)
     print("\ndtype:", output_dtype)
-    metrics = []
+    recorder = BenchmarkRecorder(
+        record_property,
+        op_name="sage_attention",
+        dtype=str(output_dtype),
+        baseline=_baseline_name(output_dtype),
+        phase="forward",
+        scope=BENCHMARK_SCOPE,
+    )
     for shape in shapes:
         result = _benchmark_case(
             shape,
@@ -298,34 +308,23 @@ def _run_benchmark_cases(
             maxnreg=maxnreg,
         )
         _print_row(shape, output_dtype, result)
-        metrics.append(
-            benchmark_metric(
-                shape_detail=shape,
-                latency_base=result.baseline_ms,
-                latency=result.flagattention_ms,
-                speedup=result.speedup,
-                accuracy=result.cosine_similarity,
-                cosine_similarity=result.cosine_similarity,
-                relative_l2=result.relative_l2,
-            )
+        recorder.add(
+            shape_detail=shape,
+            latency_base=result.baseline_ms,
+            latency=result.flagattention_ms,
+            accuracy=result.cosine_similarity,
+            cosine_similarity=result.cosine_similarity,
+            relative_l2=result.relative_l2,
         )
         _record_result(record_property, shape, output_dtype, result)
-        torch.cuda.empty_cache()
-    record_benchmark_result(
-        record_property,
-        op_name="sage_attention",
-        dtype=str(output_dtype),
-        result=metrics,
-        baseline=_baseline_name(output_dtype),
-        phase="forward",
-        scope=BENCHMARK_SCOPE,
-    )
+        test_backend.device_fn.empty_cache()
+    recorder.record()
     _print_footer()
 
 
 @pytest.mark.sage_attention
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="SageAttention benchmark requires CUDA"
+    not test_backend.supports_operator("sage_attention"), reason=test_backend.skip_reason("sage_attention")
 )
 def test_sage_attention_benchmark(
     record_property: Callable[[str, object], None],
@@ -341,8 +340,8 @@ def test_sage_attention_benchmark(
 
 
 def benchmark(args: argparse.Namespace) -> None:
-    if not torch.cuda.is_available():
-        raise RuntimeError("SageAttention benchmark requires CUDA")
+    if not test_backend.supports_operator("sage_attention"):
+        raise RuntimeError("SageAttention benchmark requires an available accelerator")
 
     output_dtype = getattr(torch, args.output_dtype)
     shapes = tuple(
@@ -356,7 +355,3 @@ def benchmark(args: argparse.Namespace) -> None:
         rep=args.rep,
         maxnreg=args.maxnreg,
     )
-
-
-if __name__ == "__main__":
-    benchmark(parse_args())

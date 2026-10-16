@@ -38,6 +38,8 @@ _DEFAULT_ACCURACY_REPORT_FILE = "accuracy_result.json"
 _DEFAULT_BENCHMARK_REPORT_FILE = "benchmark_result.json"
 _BENCHMARK_DETAIL_FIELDS = ("op_name", "dtype", "mode", "level", "result")
 _BENCHMARK_METRIC_FIELDS = (
+    "case_id",
+    "candidate_source",
     "legacy_shape",
     "shape_detail",
     "latency_base",
@@ -81,6 +83,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "Compatibility option for the shared FlagOS test runner. "
             "FlagAttention tests currently keep their declared parameter sets."
         ),
+    )
+    group.addoption(
+        "--level",
+        action="store",
+        default=None,
+        help="Compatibility option accepted by the shared FlagOS benchmark runner.",
     )
     group.addoption(
         "--collect-marks",
@@ -138,6 +146,17 @@ def _operator_key(marks: list[str], selected_mark: str | None, default: str) -> 
     return marks[0] if marks else default
 
 
+_AUXILIARY_MARKS = {"gpu", "sm90", "performance", "benchmark"}
+
+
+def _operator_marks(item: pytest.Item) -> list[str]:
+    """Return unique operator marks, excluding execution and reporting tags."""
+    return list(dict.fromkeys(
+        mark.name for mark in item.iter_markers()
+        if mark.name not in _BUILTIN_MARKS and mark.name not in _AUXILIARY_MARKS
+    ))
+
+
 class _MarkCollector:
     """Collect operator marks for the shared FlagOS runner."""
 
@@ -149,12 +168,8 @@ class _MarkCollector:
         self, session: pytest.Session, config: pytest.Config, items: list[pytest.Item]
     ) -> None:
         for item in items:
-            marks = [
-                mark.name
-                for mark in item.iter_markers()
-                if mark.name not in _BUILTIN_MARKS
-            ]
-            self.items.append({"nodeid": item.nodeid, "marks": sorted(set(marks))})
+            marks = _operator_marks(item)
+            self.items.append({"nodeid": item.nodeid, "marks": sorted(marks)})
 
     def pytest_sessionfinish(
         self, session: pytest.Session, exitstatus: pytest.ExitCode
@@ -185,11 +200,7 @@ class _JsonResultRecorder:
     def pytest_runtest_protocol(self, item: pytest.Item, nextitem: pytest.Item | None):
         callspec = getattr(item, "callspec", None)
         params = dict(callspec.params) if callspec is not None else {}
-        operator_marks = [
-            mark.name
-            for mark in item.iter_markers()
-            if mark.name not in _BUILTIN_MARKS
-        ]
+        operator_marks = _operator_marks(item)
         if _is_benchmark_path(Path(str(item.path)), self.rootpath):
             key = _operator_key(operator_marks, self.selected_mark, item.nodeid)
             self.item_keys[item.nodeid] = key
@@ -229,6 +240,18 @@ class _JsonResultRecorder:
                 for name, value in report.user_properties:
                     if name == _BENCHMARK_RESULT_PROPERTY:
                         detail = _normalize_benchmark_detail(value)
+                        dtype_name = str(detail["dtype"]).removeprefix("torch.")
+                        offset = sum(
+                            len(item["result"])
+                            for item in result["details"]
+                            if item["dtype"] == detail["dtype"]
+                        )
+                        for index, metric in enumerate(detail["result"], start=offset):
+                            if metric["case_id"] is None:
+                                metric["case_id"] = (
+                                    f"{report.nodeid}::{detail['level']}::"
+                                    f"{dtype_name}::{index}"
+                                )
                         identity = tuple(
                             detail[field] for field in _BENCHMARK_DETAIL_FIELDS[:-1]
                         )
@@ -641,6 +664,8 @@ def _is_benchmark_invocation(config: pytest.Config) -> bool:
 def _merge_json_report(
     output: Path, results: dict[str, dict[str, Any]], summary: dict[str, Any]
 ) -> None:
+    """Keep the requested report in FlagGems' raw operator/case format."""
+
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("a+", encoding="utf-8") as report_file:
         fcntl.flock(report_file, fcntl.LOCK_EX)
@@ -656,11 +681,11 @@ def _merge_json_report(
             else:
                 existing = {}
 
+            # Older reports mixed upload metadata into the raw FlagGems map.
+            # Remove those reserved keys when an output path is reused.
+            for reserved in ("timestamp", "env", "result"):
+                existing.pop(reserved, None)
             existing.update(results)
-            # Keep the FlagGems entries for existing consumers, but the upload
-            # summary must describe only this invocation. A reused --output
-            # path must not upload an earlier operator's measurements.
-            existing.update(summary)
             serialized = json.dumps(
                 _json_safe(existing), indent=2, default=str, allow_nan=False,
             )
@@ -671,6 +696,25 @@ def _merge_json_report(
             os.fsync(report_file.fileno())
         finally:
             fcntl.flock(report_file, fcntl.LOCK_UN)
+
+    # The upload format has a different root schema. Write it separately so
+    # FlagGems can iterate every value in --output as an operator/case record.
+    summary_output = output.with_name(
+        "summary.json" if output.name != "summary.json" else "upload_summary.json"
+    )
+    with summary_output.open("a+", encoding="utf-8") as summary_file:
+        fcntl.flock(summary_file, fcntl.LOCK_EX)
+        try:
+            serialized_summary = json.dumps(
+                _json_safe(summary), indent=2, default=str, allow_nan=False,
+            )
+            summary_file.seek(0)
+            summary_file.truncate()
+            summary_file.write(serialized_summary + "\n")
+            summary_file.flush()
+            os.fsync(summary_file.fileno())
+        finally:
+            fcntl.flock(summary_file, fcntl.LOCK_UN)
 
 
 def _json_safe(value: Any) -> Any:
