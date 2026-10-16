@@ -8,7 +8,9 @@
 - Divergence: fork 15 commits, upstream 20 commits.
 - Local migration branch: `chore/align-upstream-20261016`.
 - Local backup: `backup/npu-ghd-pre-merge` at the fork baseline.
-- Original `npu-ghd` stays at its baseline; no push or PR is authorized by this task.
+- During the original migration, `npu-ghd` stayed at its baseline and no push
+  was authorized. On 2026-10-16 the user subsequently authorized documenting
+  this checkpoint and publishing it to the fork's `npu-ghd` branch, without a PR.
 - Rollback: use the backup checkout. Kernel sources, math, tile sizes, launch
   configuration and numerical policies are preserved during migration.
 
@@ -254,14 +256,27 @@ from P0 and must NOT be compared directly to P0 or called no-regression proof.
 - GitHub CI runner/container permissions and actual self-hosted workflow run
   are **BLOCKED / not verified**; the locked 910B CI config was inherited intact.
 - P4 before/after performance acceptance and complete migration sign-off remain
-  **PENDING** until GLA config and NSA backward stability are resolved.
+  **PENDING**. The subsequent forward-only scope excludes NSA backward from
+  acceptance, but does not resolve the GLA forward failure or missing coverage.
+
+## Superseding forward-only checkpoint (2026-10-16)
+
+The user subsequently limited acceptance to **forward for every operator**.
+NSA backward failures above remain historical evidence, not current acceptance
+blockers. This scope update is documentation-only: it does not restore the NSA
+compression registry override, change tests, or represent a new hardware run.
+See [the forward-only checkpoint](forward-only-checkpoint-20261016.md) for the
+current per-operator status, architecture, and authorized publication scope.
 
 ## Next scoped work
 
 1. Provide previously validated Ascend state-kernel tuning metadata, or explicitly
    authorize restoring the missing launch configuration. Do not invent/tune it
    under the current task constraints.
-2. Diagnose compression backward full-suite/isolated discrepancy on an independent
-   fix branch; preserve the unregistered implementation here.
+2. Under the forward-only scope, restore and validate the appropriate NSA public
+   inference registration in a separate change; preserve the implementation here.
+   Backward diagnosis is not required by the current acceptance scope.
 3. Rerun P3, then perform P4 same-protocol before/after comparisons and final CI
-   acceptance. No performance optimization or remote push has been performed.
+   acceptance. No kernel performance optimization has been performed. Publication
+   of this checkpoint is now authorized; this document alone is not proof that
+   the push succeeded.
