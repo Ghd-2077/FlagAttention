@@ -36,7 +36,7 @@ from the existing toolkit without replacing its compiler PATH.
 | P0 audit | PASS | Clean baseline, isolated branch, fresh NPU detection |
 | P1 GLA forward | PASS | 17 passed, exit 0, real 910B |
 | P2 NSA forward | PASS | Final combined run: 39 passed, exit 0 |
-| P3 strict runner | NOT RUN | No current test results |
+| P3 strict runner | PASS | 30 CPU/CLI tests passed locally and in container |
 | P4 NPU regression | NOT RUN | Historical logs do not count |
 | P5 performance/CI | NOT RUN | Historical timings do not count |
 
@@ -119,3 +119,28 @@ python -m pytest -q tests/flag_attn/test_ascend_nsa_forward.py \
 Final combined run confirms mock isolation: **39 passed**, exit **0**, 13.04s
 (`p2-final.log`). Applicable pre-commit hooks passed (`p2-hooks.log`, exit 0).
 Backward remains OUT OF SCOPE; selected-only is explicitly INTERNAL API.
+
+## P3 — Opt-in strict result gate
+
+P2 commit: `f7059e4`. Added `--strict-results`, evaluated after writing the
+unchanged summary JSON. It rejects missing/invalid worker summaries, crashed
+workers, missing requested operators/phases, non-Passed accuracy, nonzero
+subprocess exits, zero executed passes and non-Passed performance. Explicit
+`--skip-benchmarks` permits a genuinely Skipped performance entry, never a
+performance PASS. Partial Skip plus positive Pass is accepted with counts
+retained. Default non-strict exit behavior is preserved and regression-tested.
+
+Tests-first CLI run: **17 failed, 1 passed**, exit 1 (unknown strict flag before
+implementation). Final local suite: **30 passed**, exit 0; same suite in the
+container: **30 passed**, exit 0 (`p3-regression.log`). Includes 18 real
+subprocess exit-code scenarios, Ctrl-C cleanup and actual pytest node collection
+from both worker cwd layouts while an unrelated optional-backend file would
+raise if accidentally imported. Pinned Ruff 0.1.14 passes runner and tests.
+
+```sh
+# CPU-only runner tests; confcutdir avoids unrelated hardware conftest locally.
+python -m pytest -q --confcutdir=tests/flag_attn \
+  tests/flag_attn/test_test_runner.py --disable-warnings
+```
+
+No NPU mathematical correctness is inferred from these CPU/mock tests.

@@ -333,3 +333,108 @@ def test_accuracy_only_reports_benchmark_skipped(monkeypatch, runner):
     assert runner.run_benchmark_q(0, "sample") == {
         "status": "Skipped", "exit_code": 0, "duration": 0, "data": {},
     }
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("passed", 0), ("failed", 1), ("error", 1), ("timeout", 1),
+    ("notfound", 1), ("all_skipped", 1), ("zero_passed", 1),
+    ("partial_skip", 0), ("missing_operator", 1), ("missing_worker", 1),
+    ("invalid_worker", 1), ("performance_failed", 1),
+    ("performance_skipped", 1), ("skip_benchmarks", 0),
+    ("worker_crashed", 1), ("missing_accuracy", 1),
+    ("missing_performance", 1), ("non_strict_failure", 0),
+])
+def test_strict_results_actual_cli_exit_code(tmp_path, case, expected):
+    import subprocess
+
+    script = tmp_path / "simulate_runner.py"
+    tools = Path(__file__).resolve().parents[2] / "tools"
+    script.write_text(
+        '''import json,sys,types
+from pathlib import Path
+sys.path.insert(0, sys.argv.pop(1))
+case = sys.argv.pop(1)
+fake = types.ModuleType("flag_attn")
+fake.__version__ = "test"
+sys.modules["flag_attn"] = fake
+distro = types.ModuleType("distro")
+sys.modules["distro"] = distro
+import run_tests as r
+accuracy = dict(status="Passed", passed=1, failed=0, skipped=0, exit_code=0)
+performance = dict(status="Passed", exit_code=0, data={})
+if case in ("failed","error","timeout","notfound"):
+    accuracy["status"] = dict(failed="Failed",error="Error",timeout="Timeout",notfound="NotFound")[case]
+if case == "all_skipped": accuracy.update(status="Skipped",passed=0,skipped=2)
+if case == "zero_passed": accuracy["passed"] = 0
+if case == "partial_skip": accuracy["skipped"] = 2
+if case == "performance_failed": performance["status"] = "Failed"
+if case in ("performance_skipped","skip_benchmarks"): performance["status"] = "Skipped"
+if case == "non_strict_failure": accuracy["status"] = "Failed"
+entry = dict(accuracy=accuracy,performance=performance)
+if case == "missing_accuracy": entry.pop("accuracy")
+if case == "missing_performance": entry.pop("performance")
+class FakeProcess:
+    def __init__(self, **kw): self.exitcode = 7 if case == "worker_crashed" else 0
+    def start(self):
+        if case != "missing_worker":
+            data = {} if case == "missing_operator" else {"sample":entry}
+            (r.CFG.output_dir / "summary0.json").write_text("invalid" if case == "invalid_worker" else json.dumps(data))
+    def join(self): pass
+class Display:
+    def __init__(self,*a,**kw): pass
+    def init(self): pass
+    def finish(self): pass
+r.Process=FakeProcess
+r.LiveDisplay=Display
+r.display_loop=lambda *a:None
+r.probe_env=lambda:None
+r.collect_marks=lambda ops:(set(ops),set(ops))
+r.get_ops_to_test=lambda:["sample"]
+sys.exit(r.main())
+''', encoding="utf-8",
+    )
+    command = [sys.executable, str(script), str(tools), case, "--ops", "sample",
+               "--gpus", "0", "--output-dir", str(tmp_path / "results"), "--color", "never"]
+    if case != "non_strict_failure":
+        command.append("--strict-results")
+    if case == "skip_benchmarks":
+        command.append("--skip-benchmarks")
+    result = subprocess.run(command, text=True, capture_output=True, timeout=30)
+    assert result.returncode == expected, result.stdout + result.stderr
+    summary = json.loads((tmp_path / "results/summary.json").read_text())
+    assert "result" in summary
+    if case == "partial_skip":
+        assert summary["result"]["sample"]["accuracy"]["skipped"] == 2
+
+
+def test_interrupt_still_cleans_up_and_exits_nonzero(monkeypatch, runner):
+    calls = []
+    monkeypatch.setattr(runner, "INTERRUPTED", False)
+    monkeypatch.setattr(runner, "terminate_workers", lambda: calls.append("workers"))
+    monkeypatch.setattr(runner, "cleanup_intermediate_files", lambda: calls.append("files"))
+    with pytest.raises(SystemExit) as exc:
+        runner.handle_interrupt(None, None)
+    assert exc.value.code == 1
+    assert calls == ["workers", "files"]
+
+
+@pytest.mark.parametrize("kind", ["tests", "benchmark"])
+def test_inventory_nodes_are_pytest_collectable_from_worker_cwd(monkeypatch, tmp_path, runner, kind):
+    import shlex
+    import subprocess
+
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    folder = tmp_path / kind
+    folder.mkdir()
+    (folder / "test_sample.py").write_text("def test_boundary(): pass\ndef test_other(): pass\n", encoding="utf-8")
+    (folder / "test_optional_backend.py").write_text("raise ImportError('unrelated optional backend')\n", encoding="utf-8")
+    monkeypatch.setattr(runner, "get_ops_from_inventory", lambda: [{
+        "id": "sample", "tests": ["tests/test_sample.py::test_boundary"],
+        "benchmark": "benchmark/test_sample.py::test_boundary",
+    }])
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", *shlex.split(runner.inventory_targets("sample", kind))],
+        cwd=folder, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "test_boundary" in result.stdout and "test_other" not in result.stdout

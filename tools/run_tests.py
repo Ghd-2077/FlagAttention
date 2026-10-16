@@ -1399,6 +1399,40 @@ def collect_marks(ops):
     return accuracy_marks, benchmark_marks
 
 
+def strict_result_errors(final_data, requested_ops, *, skip_benchmarks=False):
+    """Validate serialized results without changing the upstream JSON schema."""
+    errors = []
+    results = final_data.get("result", {})
+    if not isinstance(results, dict):
+        return ["Missing or invalid aggregated result mapping"]
+    for op in requested_ops:
+        entry = results.get(op)
+        if not isinstance(entry, dict):
+            errors.append(f"{op}: missing worker result")
+            continue
+        accuracy = entry.get("accuracy")
+        if not isinstance(accuracy, dict):
+            errors.append(f"{op}: missing accuracy result")
+        elif (
+            accuracy.get("status") != "Passed"
+            or not isinstance(accuracy.get("passed"), int)
+            or isinstance(accuracy["passed"], bool)
+            or accuracy["passed"] <= 0
+            or accuracy.get("failed", 0) != 0
+            or accuracy.get("errors", 0) != 0
+            or accuracy.get("exit_code") != 0
+        ):
+            errors.append(f"{op}: accuracy did not pass with executed tests: {accuracy.get('status')}")
+        performance = entry.get("performance")
+        if not isinstance(performance, dict):
+            errors.append(f"{op}: missing performance result")
+        elif skip_benchmarks and performance.get("status") == "Skipped" and performance.get("exit_code") == 0:
+            pass
+        elif performance.get("status") != "Passed" or performance.get("exit_code") != 0:
+            errors.append(f"{op}: performance did not pass: {performance.get('status')}")
+    return errors
+
+
 def main():
     global OPTS
 
@@ -1488,6 +1522,11 @@ def main():
         "--skip-benchmarks",
         action="store_true",
         help="Run accuracy only; report benchmark status as Skipped",
+    )
+    parser.add_argument(
+        "--strict-results",
+        action="store_true",
+        help="Return nonzero for failed, empty, skipped or missing required results (opt-in)",
     )
     parser.add_argument(
         "--quick",
@@ -1605,16 +1644,23 @@ def main():
     total_duration_str = str(datetime.timedelta(seconds=int(total_duration)))
 
     op_data = {}
+    worker_summary_errors = []
     for gpu_id in gpu_ids:
         gpu_file = CFG.output_dir.joinpath(f"summary{gpu_id}.json")
         if not gpu_file.exists():
             perror(f"GPU {gpu_id} failed to produce a summary, recovery needed.")
+            worker_summary_errors.append(f"GPU {gpu_id}: missing worker summary")
             continue
         with gpu_file.open("r") as f:
             try:
                 result = json.load(f)
             except (json.JSONDecodeError, ValueError):
                 perror(f"GPU {gpu_id} summary is invalid JSON, skipping.")
+                worker_summary_errors.append(f"GPU {gpu_id}: invalid worker summary JSON")
+                continue
+            if not isinstance(result, dict):
+                perror(f"GPU {gpu_id} summary is not an operator mapping, skipping.")
+                worker_summary_errors.append(f"GPU {gpu_id}: invalid worker summary mapping")
                 continue
             op_data.update(result)
 
@@ -1632,7 +1678,19 @@ def main():
     cleanup_intermediate_files()
     pinfo(f"Total elapsed time ... {total_duration_str} ({total_duration}s)")
     pinfo("Test completed.")
+    if OPTS.strict_results:
+        errors = worker_summary_errors + strict_result_errors(
+            final_data, ops, skip_benchmarks=OPTS.skip_benchmarks,
+        )
+        errors.extend(
+            f"GPU {getattr(worker, '_gpu_id', '?')}: worker exit code {worker.exitcode}"
+            for worker in WORKER_PROCESSES if worker.exitcode != 0
+        )
+        for error in errors:
+            perror(f"Strict result gate: {error}")
+        return 1 if errors else 0
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
