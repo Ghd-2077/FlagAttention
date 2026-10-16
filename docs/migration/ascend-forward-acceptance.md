@@ -35,7 +35,7 @@ from the existing toolkit without replacing its compiler PATH.
 | --- | --- | --- |
 | P0 audit | PASS | Clean baseline, isolated branch, fresh NPU detection |
 | P1 GLA forward | PASS | 17 passed, exit 0, real 910B |
-| P2 NSA forward | NOT RUN | No current test results |
+| P2 NSA forward | PASS | Final combined run: 39 passed, exit 0 |
 | P3 strict runner | NOT RUN | No current test results |
 | P4 NPU regression | NOT RUN | Historical logs do not count |
 | P5 performance/CI | NOT RUN | Historical timings do not count |
@@ -82,3 +82,40 @@ Standalone Ruff on both modified test files passed.
 Static `compileall` and `git diff --check` pass. AST comparison with the baseline
 covers **45 JIT functions** (43 Ascend plus 2 shared state functions): zero
 changed function ASTs. CPU/mock checks are not hardware correctness evidence.
+
+## P2 — NSA forward-only public contract
+
+P1 commit: `96977eb`. Added only a lazy `nsa/api.py` adapter and the single
+compression registry key, preserving exact public parameter names/defaults.
+Training with any q/k/v requiring gradients is explicitly rejected while
+autograd is enabled; no detach, no no-grad decorator, no silent fallback.
+Explicit no-grad/inference contexts work. Full `parallel_nsa` is not registered.
+
+Tests-first: 8 newly selected NSA contract cases failed before implementation
+(exit 1, `p2-red.log`). The first combined implementation run had **12 failed,
+27 passed, 2 teardown errors**: the new test incorrectly monkeypatched a frozen
+device dataclass field, preventing mock cleanup and returning mock strings in
+subsequent compression tests. This is a test-isolation bug, not NPU precision
+evidence. Fixed the test by replacing the lightweight runtime device object
+within monkeypatch instead; no production device metadata or kernel changes.
+The failed log `p2-green.log` is retained, not counted as a pass.
+
+Fresh isolated reruns: registry **23 passed**, exit 0 (`p2-contract-rerun.log`);
+NPU **16 passed**, exit 0 (`p2-forward-rerun.log`). The latter comprises 4 new
+public alias/facade tests, 6 selected-only internal tests, and 6 original
+compression forward/no-grad tests. FP16/BF16 compression covers T64/128 and
+GQA, output plus natural-log LSE; selected-only covers grouped/masked branches,
+negative/future indices, empty selections, T32/33 and packed sequence lengths.
+The existing numerical tolerances and backward tests are unchanged.
+
+```sh
+python -m pytest -q tests/flag_attn/test_ascend_registry.py --disable-warnings
+python -m pytest -q tests/flag_attn/test_ascend_nsa_forward.py \
+  tests/flag_attn/test_parallel_nsa_compression.py::test_parallel_nsa_compression_fwd_accuracy \
+  tests/flag_attn/test_parallel_nsa_compression.py::test_parallel_nsa_compression_no_grad \
+  --disable-warnings
+```
+
+Final combined run confirms mock isolation: **39 passed**, exit **0**, 13.04s
+(`p2-final.log`). Applicable pre-commit hooks passed (`p2-hooks.log`, exit 0).
+Backward remains OUT OF SCOPE; selected-only is explicitly INTERNAL API.
