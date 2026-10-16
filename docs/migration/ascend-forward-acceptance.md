@@ -38,7 +38,7 @@ from the existing toolkit without replacing its compiler PATH.
 | P2 NSA forward | PASS | Final combined run: 39 passed, exit 0 |
 | P3 strict runner | PASS | 30 CPU/CLI tests passed locally and in container |
 | P4 NPU regression | PASS | 83 CPU/contract tests, 54 NPU forward/guard cases; strict runner exit 0 |
-| P5 performance/CI | NOT RUN | Historical timings do not count |
+| P5 performance/CI | BLOCKED | Measurement PASS; self-hosted CI access/execution not verified |
 
 ## Fork ownership review
 
@@ -215,3 +215,160 @@ and runner device-selection implementation are not changed.
 Final `compileall`, `git diff --check`, pinned Ruff on changed Python files,
 and applicable source pre-commit hooks pass (`p4-hooks.log`); unmatched hooks
 are Skipped. AST audit still reports **45 unchanged JIT functions**.
+
+## P5 — Comparable performance freeze and CI boundary
+
+P4 code/test commit: `c240113fad480fcc97eb62e6a6686711c5fd039f`. The isolated
+server work branch was advanced to that same commit using the transferred
+Git bundle and LF archive, without touching the original project or `npu-ghd`.
+Its generated `tests/summary.json` was moved to the untracked evidence directory,
+not deleted or staged. The isolated worktree was then confirmed clean.
+
+### Protocol and entries
+
+- Before: exported source from `cc675a5f7f456416ab75e08ac48b079c774d533f`.
+- After: `c240113fad480fcc97eb62e6a6686711c5fd039f`.
+- Same Python/container, CANN 9.0.0, torch_npu/Triton, logical device 0 in
+  existing physical mask `4,5`; same input fingerprints verified for every case.
+- Seed 42; 10 warmups, 50 repetitions; synchronize before each timer and after
+  each call; `time.perf_counter`, milliseconds; median and inclusive P10/P90.
+- **Total internal optimized API call time**, including host dispatch and
+  allocation/synchronization, not pure kernel time. Public facade/adapter cost
+  is **not** measured: before lacked the same public Sage facade, so both
+  snapshots use identical internal entry paths instead of unlike interfaces.
+- GDN2 entry: `_ascend.gdn2.chunk_fwd_infer.chunk_gdn2_fwd_infer`, BF16,
+  B1/T128/H1/K64/V64, default inference options, no initial state.
+- Sage entry: `_ascend.attn_qk_int8_per_block.forward`, FP16 V, HND,
+  B1/H2/D64/T128 or T256, unmasked, return_lse=False; quantization outside timer.
+- One identical independent harness; SHA256:
+  `29232ce1cc03a01bac1755a37025ff972f93f4836cb5ff68a64c8286d4208779`.
+- The harness, validation script and raw data are retained locally under the
+  ignored `BaselineBenchmark/forward-acceptance-20261017/` and in the untracked
+  evidence archive. Neither benchmark data nor BaselineBenchmark enters Git.
+
+### Measured results (ms)
+
+| Case | Before P10 | Before median | Before P90 | After P10 | After median | After P90 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| GDN2 BF16 T128 | 0.572142 | 0.575827 | 0.596078 | 0.580177 | 0.584006 | 0.603780 |
+| Sage FP16 T128 | 0.296456 | 0.299255 | 0.305370 | 0.300392 | 0.304056 | 0.310882 |
+| Sage FP16 T256 | 0.296950 | 0.298546 | 0.303300 | 0.301156 | 0.302940 | 0.306655 |
+
+Before/after median ratios: **0.985995 / 0.984210 / 0.985494**. These are ratios
+between two optimized snapshots, not speedups against a naive implementation.
+This single run's after medians are approximately 1.4–1.6% higher. No threshold
+was specified for performance acceptance; no repeated interleaved statistical
+study or hardware exclusivity was established. Therefore **do not claim a
+speedup or a proven zero regression**, nor attribute this small difference to
+a kernel regression. Output norms also match, but norms alone are not an
+accuracy proof; use the independent P4 references for correctness.
+
+Both benchmark commands exit **0** (`p5-before.log`, `p5-after.log`), each with
+all 50 raw samples per case. A separate comparison verifies environment,
+protocol and input hashes match: **COMPARABLE**, exit 0. Historical wall-clock
+and NPU-event numbers in previous reports are not substituted for this run.
+
+```sh
+# In the existing CANN/Python environment; preserve its device mask.
+python BaselineBenchmark/forward-acceptance-20261017/perf.py \
+  --root /tmp/flagattention-perf-cc675a5 --label cc675a5
+python BaselineBenchmark/forward-acceptance-20261017/perf.py \
+  --root "$PWD" --label c240113
+```
+
+### CI and final limits
+
+`.github/workflows/ops-test.yaml` and `.github/configs/backends/910B.yaml` are
+unchanged from the baseline. The inherited runner label is
+`910b-flaggems-weekly`; a copied configuration is not evidence of access.
+**CI: BLOCKED — self-hosted runner access and actual execution not verified.**
+No workflow was triggered and no branch was pushed, as required by this plan.
+No empty GitHub status is interpreted as CI PASS. Measurement and documentation
+are complete; P5 is not marked fully PASS because the CI item is unresolved.
+
+Remaining work: obtain/confirm runner access and explicitly authorize the remote
+workflow step if desired; broaden the shape matrix and measure public-wrapper
+cost in a separate, scoped follow-up. No kernel performance optimization was
+performed in this execution.
+
+## Per-stage handoff (task-book fields)
+
+Common baseline SHA: `75e0c09a881d589f4dfc939ca757638b72008428`.
+Common hardware/software: fresh environment table above, Ascend910B4-1;
+Python 3.11.15 / torch 2.9.0+cpu / torch_npu 2.9.0.post2 / Triton 3.5.1 /
+CANN 9.0.0. Raw commands, exit codes, counts and failure histories appear in
+each stage above and the untracked log archive. **Kernel changed: NO**, verified
+by unchanged ASTs of 43 Ascend + 2 shared JIT functions, not only visual diff.
+
+### 阶段：P0 — 冻结与审计
+
+- 状态：PASS。
+- 基线 SHA / 当前 SHA：`75e0c09` / `75cdfda`。
+- 修改文件：本验收记录、任务书副本。
+- 关键改动与原因：独立工作分支、远端真实 SHA/陈旧跟踪引用区分、真机环境检测。
+- 执行命令与退出码：fetch、ls-remote、祖先检查、版本/可用性检测均成功。
+- 通过/失败/跳过计数：非测试 Gate；NPU available=True，2 个可见设备。
+- 验证范围和未验证内容：冻结与环境，不代表数值验收。
+- Kernel 是否改动：否；遗留风险：后续阶段待执行。
+- 本地 commit SHA：`75cdfda`。
+
+### 阶段：P1 — GLA forward 配置
+
+- 状态：PASS。
+- 基线 SHA / 当前 SHA：`75e0c09` / `96977eb`。
+- 修改文件：Ascend YAML、Ascend 数值/注册测试、inventory、本记录。
+- 关键改动与原因：恢复有来源的 BK/BV 候选，拆分 forward/backward，修正 inventory 节点。
+- 执行命令与退出码：P1 显式 pytest，最终 exit 0；Ruff/hooks/静态检查通过。
+- 通过/失败/跳过计数：最终 17/0/0；先验配置回归 0/1/0 保留。
+- 验证范围和未验证内容：声明矩阵的前向；backward OUT OF SCOPE；非最优调参结论。
+- Kernel 是否改动：否；遗留风险：未覆盖全形状。
+- 本地 commit SHA：`96977eb`。
+
+### 阶段：P2 — NSA 推理接入
+
+- 状态：PASS。
+- 基线 SHA / 当前 SHA：`75e0c09` / `f7059e4`。
+- 修改文件：NSA api.py、后端注册表、注册/前向测试、本记录。
+- 关键改动与原因：compression 公共薄适配，显式拒绝训练，selected-only 保持内部。
+- 执行命令与退出码：P2 最终组合 pytest exit 0；pre-commit exit 0。
+- 通过/失败/跳过计数：最终 39/0/0；首轮测试隔离错误详见前文，不计 PASS。
+- 验证范围和未验证内容：公共 compression 和内部 selected；完整 NSA/backward 不验收。
+- Kernel 是否改动：否；遗留风险：不代表全模式、全形状支持。
+- 本地 commit SHA：`f7059e4`。
+
+### 阶段：P3 — Runner 严格结果 Gate
+
+- 状态：PASS。
+- 基线 SHA / 当前 SHA：`75e0c09` / `1a097ec`。
+- 修改文件：tools/run_tests.py、Runner 测试、本记录。
+- 关键改动与原因：opt-in 严格退出、有效 summary 检查，保留默认行为与 JSON 格式。
+- 执行命令与退出码：本地/容器 Runner pytest 均 exit 0；Ruff 通过。
+- 通过/失败/跳过计数：最终各 30/0/0；包含真实 CLI 子进程、collection 和 Ctrl-C 测试。
+- 验证范围和未验证内容：CPU/mock 与调度契约，不作为 NPU 精度证明。
+- Kernel 是否改动：否；遗留风险：CI 须显式启用严格开关。
+- 本地 commit SHA：`1a097ec`。
+
+### 阶段：P4 — 910B forward 综合回归
+
+- 状态：PASS。
+- 基线 SHA / 当前 SHA：`75e0c09` / `c240113`。
+- 修改文件：补充公共入口/错误路径测试、本记录。
+- 关键改动与原因：显式前向节点、真机/源码来源检测、真实严格 Runner。
+- 执行命令与退出码：p4-final 整体 exit 0；首次 CRLF 静态失败 exit 2 保留。
+- 通过/失败/跳过计数：CPU 83/0/0，NPU 54/0/0；Runner GDN2 9/0/83、Sage 7/0/0。
+- 验证范围和未验证内容：本轮声明矩阵；未覆盖 decode/full NSA/所有形状；性能 Skip 非 PASS。
+- Kernel 是否改动：否；遗留风险：广覆盖与 CI 权限仍需后续验证。
+- 本地 commit SHA：`c240113`。
+
+### 阶段：P5 — 性能冻结与交付
+
+- 状态：BLOCKED（仅 CI）；同协议基线测量 PASS。
+- 基线 SHA / 当前 SHA：性能对比 `cc675a5` / `c240113`；最终附加提交仅记录文档。
+- 修改文件：本记录；harness/原始数据只保存在忽略目录与本地证据包。
+- 关键改动与原因：统一时间口径、输入指纹、分位数和 CI 状态，防止虚报无回退。
+- 执行命令与退出码：before/after benchmark 与可比性校验均 exit 0；CI NOT RUN/BLOCKED。
+- 通过/失败/跳过计数：两个快照各 3 个案例、每例 50 次；未执行 CI 不算 PASS。
+- 验证范围和未验证内容：小尺寸内部优化入口，不是 public-wrapper 成本或全形状收益。
+- Kernel 是否改动：否；遗留风险与下一阶段入口：自托管权限、授权后的 CI 和更广性能矩阵。
+- 本地 commit SHA：本节随 `docs(ascend): record forward acceptance and perf baseline` 提交；
+  使用 `git log -1 --format=%H` 获取最终文档提交，避免自引用 SHA。
