@@ -62,7 +62,7 @@ def test_gdn2_public_registry_and_signature():
 
     generic = importlib.import_module("flag_attn.gdn2.chunk")
     selected = resolve_operator("chunk_gdn2", "flag_attn.gdn2.chunk", vendor="nvidia")
-    assert selected.__module__ == "flag_attn.runtime.backend._nvidia.gdn2.chunk"
+    assert selected.__module__ == "flag_attn.gdn2.chunk"
     assert inspect.signature(selected) == inspect.signature(generic.chunk_gdn2)
     if test_backend.is_nvidia():
         assert chunk_gdn2 is facade is selected
@@ -75,7 +75,7 @@ def test_gdn2_public_registry_and_signature():
 def test_gdn2_non_nvidia_lazy_import(vendor):
     code = (
         "import sys; import flag_attn; import flag_attn.gdn2; "
-        "assert 'flag_attn.runtime.backend._nvidia.gdn2.chunk' not in sys.modules; "
+        "assert 'flag_attn.gdn2.chunk' not in sys.modules; "
         "assert 'triton.experimental.tle.language' not in sys.modules"
     )
     env = dict(os.environ, FLAG_ATTN_BACKEND=vendor, PYTHONPATH=os.pathsep.join(sys.path))
@@ -259,7 +259,7 @@ def test_k1_tle_resource_controls_are_enabled():
 @pytest.mark.chunk_gdn2
 @pytest.mark.parametrize("intermediate", [False, True])
 def test_nvidia_gdn2_missing_tle_uses_native(monkeypatch, intermediate):
-    module = importlib.import_module("flag_attn.runtime.backend._nvidia.gdn2.chunk")
+    module = importlib.import_module("flag_attn.gdn2.chunk")
     native = importlib.import_module("flag_attn.gdn2.native.chunk_fwd")
     monkeypatch.setattr(module, "HAS_TLE_GDN2", False)
     expected = tuple(object() for _ in range(12))
@@ -269,7 +269,7 @@ def test_nvidia_gdn2_missing_tle_uses_native(monkeypatch, intermediate):
         captured.update(kwargs)
         return expected
 
-    monkeypatch.setattr(native, "chunk_gdn2_fwd", native_forward)
+    monkeypatch.setattr(module, "chunk_gdn2_fwd", native_forward)
     q = torch.empty(1, 16, 1, 64)
     state = object()
     result = module.chunk_gdn2(
@@ -285,7 +285,7 @@ def test_nvidia_gdn2_missing_tle_uses_native(monkeypatch, intermediate):
 
 @pytest.mark.chunk_gdn2
 def test_nvidia_gdn2_tle_errors_propagate(monkeypatch):
-    module = importlib.import_module("flag_attn.runtime.backend._nvidia.gdn2.chunk")
+    module = importlib.import_module("flag_attn.gdn2.chunk")
     monkeypatch.setattr(module, "HAS_TLE_GDN2", True)
 
     def failure(**kwargs):
@@ -301,13 +301,19 @@ def test_nvidia_gdn2_tle_errors_propagate(monkeypatch):
 @pytest.mark.parametrize("final_state,intermediate", [(False, False), (True, True)])
 @torch.inference_mode()
 def test_nvidia_gdn2_native_fallback_matches_generic(monkeypatch, dtype, final_state, intermediate):
-    module = importlib.import_module("flag_attn.runtime.backend._nvidia.gdn2.chunk")
+    module = importlib.import_module("flag_attn.gdn2.chunk")
     generic = importlib.import_module("flag_attn.gdn2.chunk")
     monkeypatch.setattr(module, "HAS_TLE_GDN2", False)
     monkeypatch.setattr(generic, "HAS_TLE_GDN2", False)
     args, kwargs = _make_inputs(B=1, T=4096, H=16, K=64, V=64, dtype=dtype, state_v_first=False)
     kwargs.update(output_final_state=final_state, return_intermediate_states=intermediate)
-    expected = generic.chunk_gdn2(*args, **kwargs)
+    reference_kwargs = dict(kwargs)
+    reference_kwargs.pop("use_qk_l2norm_in_kernel", None)
+    reference = chunk_gdn2_fwd(
+        q=args[0], k=args[1], v=args[2], g=args[3], b=args[4], w_gate=args[5],
+        **reference_kwargs,
+    )
+    expected = (reference[0], reference[1], reference[10]) if intermediate else reference[:2]
     actual = module.chunk_gdn2(*args, **kwargs)
     assert len(actual) == len(expected) == (3 if intermediate else 2)
     for index, (value, reference) in enumerate(zip(actual, expected)):
