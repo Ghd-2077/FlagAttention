@@ -23,17 +23,11 @@ from .backend import get_backend_name
 
 
 class TunedConfigLoader:
-    def __init__(
-        self,
-        backend: str | None = None,
-        config_filename: str | Path = "tune_configs.yaml",
-    ):
+    def __init__(self, backend: str | None = None):
         backend = backend or get_backend_name()
         config_path = (
-            Path(__file__).parent / "backend" / f"_{backend}" / config_filename
+            Path(__file__).parent / "backend" / f"_{backend}" / "tune_configs.yaml"
         )
-        self._config_path = config_path
-        self._allow_empty_tuning = Path(config_filename).is_absolute()
         try:
             with config_path.open() as config_file:
                 self._configs = yaml.safe_load(config_file) or {}
@@ -68,24 +62,12 @@ class TunedConfigLoader:
         except ValueError as error:
             raise KeyError(
                 f"No measured configuration for {op_name} workload={workload}; "
-                "run offline tuning and load its YAML file"
+                "add the offline-tuned workload to tune_configs.yaml"
             ) from error
         return self.get_tuned_config(op_name)[index]
 
     def get_workload_kernel(self, op_name: str, kernel, arguments: dict):
-        """Use native single-config Autotune, retaining the original JIT/heuristics.
-
-        An explicitly empty file enables the original offline search. Missing
-        files or unmatched workloads never silently trigger that search.
-        """
-        if not self._configs:
-            if not self._config_path.is_file():
-                raise FileNotFoundError(self._config_path)
-            if not self._allow_empty_tuning:
-                raise ValueError(
-                    "Empty runtime workload YAML; offline tuning requires an explicit external file"
-                )
-            return kernel
+        """Use native single-config Autotune, retaining the original JIT/heuristics."""
         tuner = kernel.fn
         key = tuple(arguments[name] for name in tuner.keys)
         key += tuple(

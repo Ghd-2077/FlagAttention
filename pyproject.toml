@@ -67,7 +67,7 @@ namespaces = false
 
 [tool.setuptools.package-data]
 "flag_attn.runtime.backend._nvidia" = [
-    "tune_configs_gdn2.yaml",
+    "tune_configs.yaml",
 ]
 
 [tool.pytest.ini_options]

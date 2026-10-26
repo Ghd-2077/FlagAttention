@@ -12,14 +12,11 @@ otherwise Triton.
 
 from __future__ import annotations
 
-import os
-
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-# 此仓库的pre index的入口参数没有BT，不支持varlen
 from flag_attn.utils import has_triton_tle
 from flag_attn.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
 from flag_attn.runtime.configs_loader import TunedConfigLoader
@@ -48,11 +45,7 @@ __all__ = ["chunk_gdn2"]
 K1_TLE_MAXNREG_CANDIDATES = (64, 72, 96)
 K1_TLE_SMEM_REUSE_MIN_K = 256
 
-_gdn2_config_loader = TunedConfigLoader(
-    config_filename=os.environ.get(
-        "FLAG_ATTN_GDN2_TUNE_CONFIG", "tune_configs_gdn2.yaml"
-    )
-)
+_gdn2_config_loader = TunedConfigLoader()
 
 
 def _generate_constraints(num_pack):
@@ -108,7 +101,6 @@ def softplus_nv(x):
 
 softplus = softplus_nv
 
-# triton实现
 
 # 3. TLE kernels for GDN-2 prefill, BT=16, inference path.
 if HAS_TLE_GDN2:
@@ -1492,7 +1484,7 @@ if HAS_TLE_GDN2:
         )
 
 
-# 4. 唯一公开入口
+# 4. Public entry point
 def chunk_gdn2(
     q,
     k,
