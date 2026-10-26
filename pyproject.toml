@@ -15,13 +15,16 @@
 [project]
 name = "flag_attn"
 dynamic = ["version"]
+
 authors = [
-    {name = "Chen Feiyu", email = "iclementine@outlook.com"},
+    { name = "Chen Feiyu", email = "iclementine@outlook.com" },
 ]
+
 description = "A collection of memory efficient attention operators implemented in triton language."
-readme = {file= "README.md", content-type="text/markdown"}
+readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
-license = {text = "LICENSE.txt"}
+license = { file = "LICENSE" }
+
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",
@@ -34,14 +37,16 @@ dependencies = []
 triton = [
     "triton>=2.2.0",
 ]
+
 test = [
     "pytest>=7.1.0",
     "PyYAML>=6.0",
+    "distro==1.9.0",
+    "flash-linear-attention[cuda]",
 ]
 
 [project.urls]
 homepage = "https://github.com/FlagOpen/FlagAttention"
-
 
 [build-system]
 requires = ["setuptools>=60", "setuptools-scm>=8.0"]
@@ -52,19 +57,48 @@ version_file = "src/flag_attn/_version.py"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["flag_attn", "flag_attn.*"]
+include = [
+    "flag_attn",
+    "flag_attn.*",
+    "inkling_fa4",
+    "inkling_fa4.*",
+]
 namespaces = false
 
-# helps for setting up pytest in pyprojects
-# https://docs.pytest.org/en/7.3.x/reference/customize.html#rootdir
-# https://docs.pytest.org/en/7.3.x/reference/reference.html#confval-pythonpath
 [tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
 testpaths = [
     "tests",
 ]
+
 pythonpath = [
+    ".",
     "src",
     "tests/flag_attn",
+]
+markers = [
+    "hy3_attention: Hy3 prefill and BF16/FP8 static/dynamic decode tests and benchmarks",
+    "fused_attnres: fused attention residual tests and benchmarks",
+    "parallel_forgetting_attn: ACP-enabled forgetting attention tests and benchmarks",
+    "parallel_parallax: Parallax prefill and decode tests and benchmarks",
+    "infllmv2_attention: InfLLM-V2 prefill, backward, and decode tests and benchmarks",
+    "log_linear_attn: log-linear attention tests and benchmarks",
+    "diffkv_attention: DiffKV attention tests and benchmarks",
+    "sm90: requires Hopper SM90 GPU",
+    "chunk_gated_delta_rule: chunked gated delta rule tests and benchmarks",
+    "chunk_gdn2: chunked GDN2 tests and benchmarks",
+    "chunk_gla: chunked gated linear attention tests and benchmarks",
+    "chunk_kda: Kimi Delta Attention",
+    "chunk_kda_enflame: inventory alias for Enflame Kimi Delta Attention tests and benchmark",
+    "minimax_m3_sparse_attn: MiniMax M3 prefill, decode, and top-k tests and benchmarks",
+    "parallel_moba: parallel MoBA tests and benchmarks",
+    "parallel_nsa: native sparse attention selection, compression, and full pipeline",
+    "parallel_wall_attn: Wall-Attention correctness and performance tests",
+    "sage_attention: SageAttention tests and benchmarks",
+    "gpu: requires CUDA GPU",
+    "performance: performance benchmark",
+    "benchmark: benchmark entry point",
+    "inkling_fa4_rel_attention: Inkling FA4 relative-attention operator tests",
 ]
 
 [tool.ruff]

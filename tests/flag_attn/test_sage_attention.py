@@ -39,7 +39,7 @@ def _headwise_matmul(left, right):
     )
 
 
-def _reference(q, k, v, q_scale, k_scale, tensor_layout, attn_mask=None):
+def _reference(q, k, v, q_scale, k_scale, tensor_layout, attn_mask=None, is_causal=False):
     if tensor_layout == "NHD":
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -53,6 +53,9 @@ def _reference(q, k, v, q_scale, k_scale, tensor_layout, attn_mask=None):
     v = torch.repeat_interleave(v, num_groups, dim=1)
 
     logits_log2 = _headwise_matmul(q, k.transpose(-1, -2))
+    if is_causal:
+        causal_mask = torch.ones(q.shape[-2], k.shape[-2], device=q.device, dtype=torch.bool).tril()
+        logits_log2 = logits_log2.masked_fill(~causal_mask, float("-inf"))
     if attn_mask is not None:
         if attn_mask.dtype == torch.bool:
             logits_log2 = logits_log2.masked_fill(~attn_mask, float("-inf"))
@@ -73,7 +76,8 @@ def _reference(q, k, v, q_scale, k_scale, tensor_layout, attn_mask=None):
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tuned", [False, True])
-def test_forward_matches_dequantized_reference(tensor_layout, num_kv_heads, head_dim, output_dtype, tuned):
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_forward_matches_dequantized_reference(tensor_layout, num_kv_heads, head_dim, output_dtype, tuned, is_causal):
     torch.manual_seed(2026)
     batch_size, num_query_heads, seq_len = 1, 2, 128
     q = torch.randn(batch_size, num_query_heads, seq_len, head_dim, device="cuda", dtype=torch.float16)
@@ -96,6 +100,7 @@ def test_forward_matches_dequantized_reference(tensor_layout, num_kv_heads, head
         return_lse=True,
         output_dtype=output_dtype,
         maxnreg=(168 if head_dim == 64 else 128) if tuned else None,
+        is_causal=is_causal,
     )
     expected, expected_lse = _reference(
         q_int8,
@@ -104,6 +109,7 @@ def test_forward_matches_dequantized_reference(tensor_layout, num_kv_heads, head
         q_scale,
         k_scale,
         tensor_layout,
+        is_causal=is_causal,
     )
 
     torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
@@ -145,6 +151,7 @@ def test_forward_supports_masks_and_partial_blocks(mask_kind):
         attn_mask=attn_mask,
         return_lse=True,
         maxnreg=168,
+        is_causal=False,
     )
     expected, expected_lse = _reference(
         q_int8,
@@ -158,3 +165,111 @@ def test_forward_supports_masks_and_partial_blocks(mask_kind):
 
     torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(actual_lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("length", [64, 129, 257])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
+def test_causal_default_and_partial_tiles(length, head_dim, output_dtype):
+    torch.manual_seed(42)
+    q = torch.randn((1, 2, length, head_dim), device="cuda", dtype=torch.float16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    qi, qs, ki, ks = per_block_int8(q, k)
+    actual, actual_lse = forward(qi, ki, v, qs, ks, output_dtype=output_dtype, return_lse=True)
+    expected, expected_lse = _reference(qi, ki, v, qs, ks, "HND", is_causal=True)
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual_lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+
+def test_causal_future_values_do_not_affect_prefix():
+    torch.manual_seed(7)
+    q = torch.randn((2, 2, 256, 64), device="cuda", dtype=torch.float16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    qi, qs, ki, ks = per_block_int8(q, k)
+    actual, _ = forward(qi, ki, v, qs, ks)
+    changed_v = v.clone()
+    changed_v[..., 64:, :] += 10
+    changed, _ = forward(qi, ki, changed_v, qs, ks)
+    torch.testing.assert_close(actual[..., :64, :], changed[..., :64, :], atol=0, rtol=0)
+
+
+def test_causal_rejects_unequal_lengths_and_explicit_mask():
+    q = torch.ones((1, 1, 128, 64), device="cuda", dtype=torch.int8)
+    k = torch.ones((1, 1, 64, 64), device="cuda", dtype=torch.int8)
+    v = torch.ones(k.shape, device="cuda", dtype=torch.float16)
+    qs, ks = torch.ones((1, 1, 1), device="cuda"), torch.ones((1, 1, 1), device="cuda")
+    with pytest.raises(ValueError, match="equal"):
+        forward(q, k, v, qs, ks)
+    with pytest.raises(ValueError, match="attn_mask"):
+        forward(q, q, v, qs, ks, attn_mask=torch.ones((1, 1, 128, 128), device="cuda", dtype=torch.bool))
+
+
+def test_benchmark_defaults_to_causal(monkeypatch):
+    from benchmark.test_sage_attention_benchmark import parse_args
+
+    monkeypatch.setattr("sys.argv", ["sage_attention_benchmark.py"])
+    assert parse_args().is_causal is True
+    monkeypatch.setattr("sys.argv", ["sage_attention_benchmark.py", "--no-is-causal"])
+    assert parse_args().is_causal is False
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_benchmark_times_quantization_and_attention(monkeypatch, is_causal):
+    import benchmark.test_sage_attention_benchmark as bench
+
+    state = {"timed": False, "provider": 0}
+    quant_calls, attention_calls, baseline_calls = [], [], []
+
+    def quantize(q, k):
+        assert q.dtype == k.dtype == torch.float16
+        quant_calls.append((state["timed"], state["provider"]))
+        scale = torch.ones((1, 1, 1), device=q.device)
+        return q.to(torch.int8), scale, k.to(torch.int8), scale
+
+    def attention(q, k, v, q_scale, k_scale, **kwargs):
+        assert q.dtype == k.dtype == torch.int8
+        assert kwargs["is_causal"] is is_causal
+        attention_calls.append((state["timed"], state["provider"]))
+        return v.to(kwargs["output_dtype"]), None
+
+    def baseline(q, k, v, **kwargs):
+        assert kwargs["is_causal"] is is_causal
+        baseline_calls.append((state["timed"], state["provider"]))
+        return v
+
+    def timer(function, **kwargs):
+        state["provider"] += 1
+        state["timed"] = True
+        try:
+            for _ in range(2):
+                function()
+        finally:
+            state["timed"] = False
+        return 1.0
+
+    monkeypatch.setattr(bench, "per_block_int8", quantize)
+    monkeypatch.setattr(bench, "sage_attention", attention)
+    monkeypatch.setattr(bench, "_run_baseline", baseline)
+    monkeypatch.setattr(bench, "_accuracy_metrics", lambda actual, expected: (1.0, 0.0))
+    monkeypatch.setattr(bench.test_backend, "do_bench", timer)
+    bench._benchmark_case((1, 1, 128, 64), output_dtype=torch.bfloat16, is_causal=is_causal)
+    assert [call for call in quant_calls if call[0]] == [(True, 2), (True, 2)]
+    assert [call for call in attention_calls if call[0]] == [(True, 2), (True, 2)]
+    assert [call for call in baseline_calls if call[0]] == [(True, 1), (True, 1)]
+    assert bench.BENCHMARK_SCOPE == "quantization_and_attention"
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_benchmark_records_total_scope_and_causal(monkeypatch, is_causal):
+    import benchmark.test_sage_attention_benchmark as bench
+
+    monkeypatch.setattr(bench, "_benchmark_case", lambda *args, **kwargs: bench.BenchmarkResult(2.0, 1.0, 1.0, 0.0))
+    records = {}
+    bench._run_benchmark_cases(((1, 1, 128, 64),), output_dtype=torch.bfloat16,
+                               warmup=1, rep=1, maxnreg=None, is_causal=is_causal,
+                               record_property=lambda key, value: records.update({key: value}))
+    result = records["flag_attn_benchmark_result"]
+    assert result["mode"] == "api"
+    assert result["scope"] == "quantization_and_attention"
+    assert result["is_causal"] is is_causal
+    assert result["result"][0]["latency"] == 1.0

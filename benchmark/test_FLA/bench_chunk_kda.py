@@ -12,16 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import argparse
 import math
+import sys
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 import triton
 
-from fla.chunk_kda import chunk_kda_fwd_infer
+from flag_attn.testing import backend as test_backend
+from flag_attn import chunk_kda as chunk_kda_fwd_infer
 
 try:
+    from benchmark.recording import benchmark_metric, record_benchmark_result
+except ModuleNotFoundError:  # Direct execution from benchmark/test_FLA.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from recording import benchmark_metric, record_benchmark_result
+
+try:
+    if not test_backend.is_nvidia():
+        raise ImportError("FlashKDA is an optional NVIDIA comparison")
     import flash_kda
 except ImportError:
     flash_kda = None
@@ -37,7 +49,7 @@ BENCHMARK_CASES = {
 
 
 def _make_inputs(seq_lens: list[int], H: int):
-    device = torch.device("cuda")
+    device = torch.device(test_backend.device)
     dtype = torch.bfloat16
     T = sum(seq_lens)
     N = len(seq_lens)
@@ -115,8 +127,8 @@ def benchmark_case(
                 return output, final_state
 
         run()
-        torch.cuda.synchronize()
-        latency_ms = triton.testing.do_bench(run, warmup=warmup, rep=rep)
+        test_backend.device_fn.synchronize()
+        latency_ms = test_backend.do_bench(run, warmup=warmup, rep=rep)
         token_heads_per_second = sum(seq_lens) * H / latency_ms * 1e3
         results[provider] = latency_ms, token_heads_per_second
         print(
@@ -143,8 +155,8 @@ def main() -> None:
     parser.add_argument("--provider", choices=("tle", "flash-kda"), action="append")
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("chunk_kda benchmark requires CUDA")
+    if not test_backend.is_available():
+        raise RuntimeError("chunk_kda benchmark requires an available accelerator")
     if args.heads <= 0 or args.warmup < 0 or args.rep <= 0:
         parser.error("--heads and --rep must be positive; --warmup must be non-negative")
 
@@ -157,9 +169,38 @@ def main() -> None:
     providers = args.provider or ["tle"] + (["flash-kda"] if flash_kda is not None else [])
 
     torch.manual_seed(42)
-    print(f"GPU: {torch.cuda.get_device_name()} | dtype=bfloat16 | D={D_HEAD}")
+    print(f"GPU: {test_backend.get_device_name()} | dtype=bfloat16 | D={D_HEAD}")
+    metrics = []
     for name, seq_lens in cases:
-        benchmark_case(name, seq_lens, args.heads, args.warmup, args.rep, providers)
+        results = benchmark_case(name, seq_lens, args.heads, args.warmup, args.rep, providers)
+        if "tle" in results:
+            latency = results["tle"][0]
+            baseline = results.get("flash-kda")
+            baseline_ms = baseline[0] if baseline is not None else None
+            metrics.append(
+                benchmark_metric(
+                    shape_detail={
+                        "case": name,
+                        "seq_lens": seq_lens,
+                        "H": args.heads,
+                        "D": D_HEAD,
+                    },
+                    latency_base=baseline_ms,
+                    latency=latency,
+                    speedup=baseline_ms / latency if baseline_ms is not None else None,
+                )
+            )
+
+    if metrics:
+        record_benchmark_result(
+            None,
+            op_name="chunk_kda",
+            dtype=str(torch.bfloat16),
+            result=metrics,
+            baseline="FlashKDA" if "flash-kda" in providers else None,
+        )
+    else:
+        print("[benchmark] FlagAttention TLE provider not selected; no speedup record")
 
 
 if __name__ == "__main__":
