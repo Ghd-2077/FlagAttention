@@ -1039,6 +1039,42 @@ def test_upload_summary_reports_empty_mark_without_performance(tmp_path):
     assert operator["customized"] is False
 
 
+def test_path_free_marked_run_collects_benchmark_without_recording(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n', encoding="utf-8"
+    )
+    accuracy = tmp_path / "tests" / "test_selected.py"
+    accuracy.parent.mkdir()
+    accuracy.write_text(
+        "import pytest\n@pytest.mark.selected\ndef test_accuracy(): pass\n",
+        encoding="utf-8",
+    )
+    benchmark = tmp_path / "benchmark" / "test_selected_benchmark.py"
+    benchmark.parent.mkdir()
+    benchmark.write_text(
+        "import pytest\n@pytest.mark.selected\ndef test_benchmark(): pass\n",
+        encoding="utf-8",
+    )
+    collected = _invoke_pytest(tmp_path, [], "-m", "selected", "--collect-only")
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert "tests/test_selected.py::test_accuracy" in collected.stdout
+    assert "benchmark/test_selected_benchmark.py::test_benchmark" in collected.stdout
+    completed = _invoke_pytest(tmp_path, [], "-m", "selected")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "2 passed" in completed.stdout
+    assert not list(tmp_path.glob("*.json"))
+
+    # No marker: retain the configured accuracy-only default.
+    default = _invoke_pytest(tmp_path, [])
+    assert default.returncode == 0, default.stdout + default.stderr
+    assert "1 passed" in default.stdout
+
+    # Explicit paths must not silently expand to benchmark/.
+    explicit = _invoke_pytest(tmp_path, ["tests/test_selected.py"], "-m", "selected")
+    assert explicit.returncode == 0, explicit.stdout + explicit.stderr
+    assert "1 passed" in explicit.stdout
+
+
 def test_path_free_marked_upload_run_collects_benchmark(tmp_path):
     (tmp_path / "pyproject.toml").write_text(
         '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n', encoding="utf-8"
