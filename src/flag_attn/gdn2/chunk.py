@@ -19,7 +19,6 @@ import triton.language as tl
 
 from flag_attn.utils import has_triton_tle
 from flag_attn.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
-from flag_attn.runtime.configs_loader import TunedConfigLoader
 
 from .native.chunk_fwd import chunk_gdn2_fwd
 from .triton_ops_helper import autotune_cache_kwargs, exp2
@@ -40,12 +39,14 @@ else:
     HAS_TLE_GDN2 = False
 
 
+if HAS_TLE_GDN2:
+    from ._workload_tuning import get_gdn2_workload_kernel
+
+
 __all__ = ["chunk_gdn2"]
 
 K1_TLE_MAXNREG_CANDIDATES = (64, 72, 96)
 K1_TLE_SMEM_REUSE_MIN_K = 256
-
-_gdn2_config_loader = TunedConfigLoader()
 
 
 def _generate_constraints(num_pack):
@@ -561,7 +562,7 @@ if HAS_TLE_GDN2:
             V=V,
             BT=BT,
         )
-        kernel = _gdn2_config_loader.get_workload_kernel(
+        kernel = get_gdn2_workload_kernel(
             "_chunk_gdn2_fwd_intra_infer_kernel",
             _chunk_gdn2_fwd_intra_infer_kernel,
             launch_arguments,
@@ -1350,7 +1351,7 @@ if HAS_TLE_GDN2:
             BT=BT,
             STATE_V_FIRST=state_v_first,
         )
-        kernel = _gdn2_config_loader.get_workload_kernel(
+        kernel = get_gdn2_workload_kernel(
             "_chunk_gdn2_fwd_h_o_infer_kernel",
             _chunk_gdn2_fwd_h_o_infer_kernel,
             launch_arguments,

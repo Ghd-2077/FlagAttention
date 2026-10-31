@@ -8,7 +8,6 @@ import importlib
 import math
 from collections.abc import Callable
 
-import pytest
 import torch
 import triton
 
@@ -36,13 +35,6 @@ ALL_SHAPES = [
     (8, 1024, 8, 64, 64),
     (8, 2048, 32, 256, 256),
 ]
-
-DEFAULT_SHAPES = [
-    (2, 512, 8, 64, 64),
-    (1, 2048, 8, 64, 64),
-    (2, 2048, 16, 256, 512),
-]
-
 
 def _parse_shape(value: str) -> tuple[int, int, int, int, int]:
     try:
@@ -118,7 +110,7 @@ def run_benchmark(
     compare_native = test_backend.device == "cuda"
 
     dtype = getattr(torch, args.dtype)
-    shapes = args.shape or (ALL_SHAPES if args.full else DEFAULT_SHAPES)
+    shapes = args.shape or ALL_SHAPES
     print(f"GPU: {test_backend.get_device_name()} | dtype: {args.dtype}")
     implementation = importlib.import_module(chunk_gdn2.__module__)
     print(f"Public implementation: {chunk_gdn2.__module__} | TLE: {getattr(implementation, 'HAS_TLE_GDN2', False)}")
@@ -152,15 +144,3 @@ def run_benchmark(
         del inputs
         test_backend.device_fn.empty_cache()
     recorder.record()
-
-
-@pytest.mark.chunk_gdn2
-@pytest.mark.skipif(not test_backend.supports_operator("chunk_gdn2"), reason=test_backend.skip_reason("chunk_gdn2"))
-def test_chunk_gdn2_benchmark(record_property) -> None:
-    run_benchmark([], record_property)
-
-
-if __name__ == "__main__":
-    import sys
-
-    run_benchmark(sys.argv[1:])

@@ -47,6 +47,17 @@ pytestmark = [
 ]
 
 
+@pytest.mark.chunk_gdn2
+@pytest.mark.skipif(
+    not test_backend.supports_operator("chunk_gdn2"),
+    reason=test_backend.skip_reason("chunk_gdn2"),
+)
+def test_chunk_gdn2_benchmark(record_property) -> None:
+    from benchmark.test_gdn2_benchmark import run_benchmark
+
+    run_benchmark([], record_property=record_property)
+
+
 def _set_public_gdn2_native_for_call(force_native: bool):
     module = importlib.import_module("flag_attn.gdn2.chunk")
     old = module.HAS_TLE_GDN2
@@ -454,3 +465,193 @@ def test_gdn2_output_config_matches_reference(output_composition_case, config):
             num_stages=config.num_stages,
         )
         _assert_close("output composition", actual, expected)
+
+
+@pytest.fixture
+def gdn2_workload_tuning():
+    module = importlib.import_module("flag_attn.gdn2._workload_tuning")
+    caches = (module._tuning_source, module._workload_configs, module._workload_kernel)
+    for cache in caches:
+        cache.cache_clear()
+    yield module
+    for cache in caches:
+        cache.cache_clear()
+
+
+@pytest.mark.chunk_gdn2
+class TestGdn2WorkloadTuning:
+    K1 = "_chunk_gdn2_fwd_intra_infer_kernel"
+    K2 = "_chunk_gdn2_fwd_h_o_infer_kernel"
+    KEY = (8, 64, 64, 16, "torch.bfloat16")
+
+    @staticmethod
+    def _entry(key=KEY):
+        return dict(
+            WORKLOAD=list(key), META={"BK": 64, "BV": 64},
+            num_warps=1, num_stages=2, num_ctas=1, maxnreg=None,
+        )
+
+    def _source(self, module, monkeypatch, tmp_path, entries, count=None):
+        from types import SimpleNamespace
+        import yaml
+        import triton
+
+        (tmp_path / "tune_configs.yaml").write_text(yaml.safe_dump({self.K1: entries}))
+        monkeypatch.setattr(module, "files", lambda package: tmp_path)
+        configs = [triton.Config({"BK": 64, "BV": 64}, num_warps=1, num_stages=2)]
+        if count is not None:
+            configs *= count
+        else:
+            configs *= len(entries)
+        monkeypatch.setattr(
+            module, "TunedConfigLoader",
+            lambda backend: SimpleNamespace(get_tuned_config=lambda name: configs),
+        )
+
+    @pytest.mark.parametrize("name", [K1, K2])
+    def test_shipped_configs_match_native_records(self, gdn2_workload_tuning, name):
+        import yaml
+        from importlib.resources import files
+        from flag_attn.runtime.configs_loader import TunedConfigLoader
+
+        resource = files("flag_attn.runtime.backend._nvidia").joinpath("tune_configs.yaml")
+        entries = yaml.safe_load(resource.read_text())[name]
+        before = TunedConfigLoader("nvidia").get_tuned_config(name)
+        after = gdn2_workload_tuning._workload_configs(name)
+        assert len(entries) == len(before) == len(after) == 8
+        for record, config in zip(entries, before):
+            selected = after[tuple(record["WORKLOAD"])]
+            assert selected.kwargs == config.kwargs == record["META"]
+            for field in ("num_warps", "num_stages", "num_ctas", "maxnreg"):
+                assert getattr(selected, field) == getattr(config, field) == record[field]
+
+    @pytest.mark.parametrize("case", ["unknown", "duplicate", "missing", "count"])
+    def test_invalid_records_fail(self, gdn2_workload_tuning, monkeypatch, tmp_path, case):
+        entries, count = [self._entry()], None
+        if case == "duplicate":
+            entries *= 2
+        elif case == "missing":
+            entries[0].pop("WORKLOAD")
+        elif case == "count":
+            count = 0
+        self._source(gdn2_workload_tuning, monkeypatch, tmp_path, entries, count)
+        if case == "unknown":
+            configs = gdn2_workload_tuning._workload_configs(self.K1)
+            assert (16, *self.KEY[1:]) not in configs
+            with pytest.raises(KeyError, match="No measured configuration.*workload"):
+                gdn2_workload_tuning._workload_kernel(self.K1, object(), (16, *self.KEY[1:]))
+        else:
+            message = {"duplicate": "Duplicate", "missing": "WORKLOAD", "count": "count"}[case]
+            with pytest.raises(ValueError, match=message):
+                gdn2_workload_tuning._workload_configs(self.K1)
+
+    def test_missing_yaml_keeps_explicit_miss(self, gdn2_workload_tuning, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(gdn2_workload_tuning, "files", lambda package: tmp_path)
+        monkeypatch.setattr(
+            gdn2_workload_tuning, "TunedConfigLoader",
+            lambda backend: SimpleNamespace(get_tuned_config=lambda name: []),
+        )
+        with pytest.raises(KeyError, match="No measured configuration"):
+            gdn2_workload_tuning._workload_kernel(self.K1, object(), self.KEY)
+
+    def test_native_key_preserves_argument_dtype_order(self, gdn2_workload_tuning, monkeypatch):
+        from types import SimpleNamespace
+
+        tuner = SimpleNamespace(keys=["H", "K", "V", "BT"], arg_names=["second", "H", "first", "T"])
+        kernel = SimpleNamespace(fn=tuner)
+        arguments = dict(first=torch.empty(1, dtype=torch.float32), H=8, K=64, V=64, BT=16,
+                         T=2048, second=torch.empty(1, dtype=torch.bfloat16), unused=torch.empty(1))
+        monkeypatch.setattr(gdn2_workload_tuning, "_workload_kernel", lambda op, fn, key: key)
+        key = gdn2_workload_tuning.get_gdn2_workload_kernel(self.K1, kernel, arguments)
+        assert key == (8, 64, 64, 16, "torch.bfloat16", "torch.float32")
+
+    @pytest.mark.parametrize("supports_disk_cache", [False, True])
+    def test_launcher_and_source_caches(self, gdn2_workload_tuning, monkeypatch, tmp_path, supports_disk_cache):
+        from types import SimpleNamespace
+        import gc
+        import weakref
+        import triton
+
+        self._source(gdn2_workload_tuning, monkeypatch, tmp_path, [self._entry(), self._entry((16, *self.KEY[1:]))])
+        reads, wrapped, options_seen = [], [], []
+        monkeypatch.setattr(gdn2_workload_tuning, "files", lambda package: reads.append(package) or tmp_path)
+        jit = object()
+
+        class Kernel:
+            values = {"FLAG": lambda arguments: False}
+            fn = SimpleNamespace(keys=["H", "K", "V", "BT"], arg_names=["q", "T"], fn=jit, cache_results=True)
+
+        kernel = Kernel()
+
+        def build(configs, key, options):
+            assert len(configs) == 1
+            assert key == kernel.fn.keys
+            options_seen.append(options)
+
+            def decorate(fn):
+                assert fn is jit
+                wrapped.append(configs[0])
+                return SimpleNamespace(fn=fn, configs=configs)
+            return decorate
+
+        def modern(configs, key, cache_results=False):
+            return build(configs, key, {"cache_results": cache_results})
+
+        def legacy(configs, key):
+            return build(configs, key, {})
+
+        monkeypatch.setattr(triton, "autotune", modern if supports_disk_cache else legacy)
+        monkeypatch.setattr(triton, "heuristics", lambda values: lambda fn: (values, fn))
+        tensor = torch.empty(1, dtype=torch.bfloat16)
+        reference = weakref.ref(tensor)
+        arguments = dict(q=tensor, T=2048, H=8, K=64, V=64, BT=16)
+        first = gdn2_workload_tuning.get_gdn2_workload_kernel(self.K1, kernel, arguments)
+        assert first[0] == kernel.values
+        assert gdn2_workload_tuning.get_gdn2_workload_kernel(self.K1, kernel, arguments) is first
+        other = gdn2_workload_tuning.get_gdn2_workload_kernel(self.K1, kernel, dict(arguments, H=16))
+        assert other is not first
+        assert len(wrapped) == 2 and len(reads) == 1
+        assert options_seen == ([{"cache_results": True}] * 2 if supports_disk_cache else [{}, {}])
+        del arguments, tensor
+        gc.collect()
+        assert reference() is None
+
+    def test_generic_loader_retains_original_contract(self):
+        from flag_attn.runtime.configs_loader import TunedConfigLoader
+
+        loader = TunedConfigLoader("nvidia")
+        assert not any(hasattr(loader, name) for name in ("get_workload_config", "get_workload_kernel", "_workload_kernel"))
+        first = loader.get_tuned_config("chunk_fwd_kernel_h")
+        assert loader.get_tuned_config("chunk_fwd_kernel_h") is first
+        assert [config.kwargs for config in first] == [
+            {"BK": 32, "BV": 32}, {"BK": 32, "BV": 64},
+            {"BK": 64, "BV": 32}, {"BK": 64, "BV": 64},
+        ]
+        assert TunedConfigLoader("not_installed_backend").get_tuned_config("missing") == []
+
+    def test_resource_loading_is_independent_of_cwd(self, gdn2_workload_tuning, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        assert len(gdn2_workload_tuning._workload_configs(self.K1)) == 8
+
+    @pytest.mark.parametrize("vendor", ["cpu", "amd"])
+    def test_lazy_import_avoids_private_tuning(self, vendor):
+        code = (
+            "import sys; import flag_attn; import flag_attn.gdn2; "
+            "assert 'flag_attn.gdn2._workload_tuning' not in sys.modules; "
+            "assert 'triton.experimental.tle.language' not in sys.modules"
+        )
+        env = dict(os.environ, FLAG_ATTN_BACKEND=vendor, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+    def test_no_tle_import_avoids_private_tuning(self):
+        code = (
+            "import sys; import flag_attn.utils as utils; utils.has_triton_tle=lambda *args: False; "
+            "import flag_attn.gdn2.chunk as chunk; assert not chunk.HAS_TLE_GDN2; "
+            "assert 'flag_attn.gdn2._workload_tuning' not in sys.modules"
+        )
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
