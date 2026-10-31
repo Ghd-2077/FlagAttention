@@ -21,7 +21,6 @@ import argparse
 from dataclasses import dataclass
 from typing import Callable
 
-import pytest
 import torch
 import torch.nn.functional as F
 import triton
@@ -42,16 +41,6 @@ DEFAULT_WARMUP = 25
 DEFAULT_REPETITIONS = 100
 MAX_ACCURACY_ELEMENTS = 1_048_576
 DEFAULT_OUTPUT_DTYPE = torch.bfloat16
-
-# Reuse the first three workloads from the original benchmark defaults while
-# keeping pytest runtime bounded. The longer defaults remain available through
-# the command-line entry point.
-PYTEST_CASES = (
-    (4, 32, 1024, 128),
-    (4, 32, 2048, 128),
-    (4, 32, 4096, 128),
-)
-
 
 @dataclass(frozen=True)
 class BenchmarkResult:
@@ -129,7 +118,7 @@ def _run_flagattention(
         q_scale,
         k_scale,
         output_dtype=output_dtype,
-        maxnreg=maxnreg if maxnreg is not None else (168 if q.shape[-1] == 64 else 128),
+        maxnreg=maxnreg,
         is_causal=is_causal,
     )
     return output
@@ -329,24 +318,10 @@ def _run_benchmark_cases(
     _print_footer()
 
 
-@pytest.mark.sage_attention
-@pytest.mark.skipif(
-    not test_backend.supports_operator("sage_attention"), reason=test_backend.skip_reason("sage_attention")
-)
-def test_sage_attention_benchmark(
-    record_property: Callable[[str, object], None],
+def benchmark(
+    args: argparse.Namespace,
+    record_property: Callable[[str, object], None] | None = None,
 ) -> None:
-    _run_benchmark_cases(
-        PYTEST_CASES,
-        output_dtype=DEFAULT_OUTPUT_DTYPE,
-        warmup=DEFAULT_WARMUP,
-        rep=DEFAULT_REPETITIONS,
-        maxnreg=None,
-        record_property=record_property,
-    )
-
-
-def benchmark(args: argparse.Namespace) -> None:
     if not test_backend.supports_operator("sage_attention"):
         raise RuntimeError("SageAttention benchmark requires an available accelerator")
 
@@ -362,8 +337,5 @@ def benchmark(args: argparse.Namespace) -> None:
         rep=args.rep,
         maxnreg=args.maxnreg,
         is_causal=args.is_causal,
+        record_property=record_property,
     )
-
-
-if __name__ == "__main__":
-    benchmark(parse_args())
