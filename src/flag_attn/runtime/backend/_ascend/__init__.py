@@ -13,7 +13,21 @@ _OPERATOR_EXPORTS = {
     "minimax_m3_index_decode_score": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode_score"),
     "minimax_m3_index_decode": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode"),
     "minimax_m3_sparse_attn": (".minimax_sparse_attention.sparse_attn", "minimax_m3_sparse_attn"),
+    "chunk_gated_delta_rule": (".FLA.gated_delta_rule.api", "chunk_gated_delta_rule"),
+    "chunk_gated_delta_rule_fwd": (".FLA.gated_delta_rule.chunk", "chunk_gated_delta_rule_fwd"),
+    "fused_recurrent_gated_delta_rule_fwd": (
+        ".FLA.gated_delta_rule.fused_recurrent",
+        "fused_recurrent_gated_delta_rule_fwd",
+    ),
+    "fused_recurrent_gated_delta_rule_packed_decode": (
+        ".FLA.gated_delta_rule.fused_recurrent",
+        "fused_recurrent_gated_delta_rule_packed_decode",
+    ),
+    "parallel_parallax": (".parallax", "parallel_parallax"),
+    "parallax_decode": (".parallax", "parallax_decode"),
+    "parallax_attn_with_kvcache": (".parallax", "parallax_attn_with_kvcache"),
     "forward": (".attn_qk_int8_per_block", "forward"),
+    "fused_attnres": (".FLA.attnres", "fused_attnres"),
     "per_block_int8": (".ops", "quant_per_block_int8"),
     "quant_per_block_int8": (".ops", "quant_per_block_int8"),
     "sage_attention": (".attn_qk_int8_per_block", "forward"),
@@ -21,13 +35,7 @@ _OPERATOR_EXPORTS = {
     "sage_attention_per_block_int8": (".ops", "quant_per_block_int8"),
 }
 
-__all__ = [
-    "chunk_gdn2", "chunk_gla", "chunk_kda_fwd_infer", "forward",
-    "minimax_m3_index_decode", "minimax_m3_index_decode_score",
-    "minimax_m3_index_score", "minimax_m3_index_topk", "minimax_m3_sparse_attn",
-    "parallel_nsa_compression", "per_block_int8", "quant_per_block_int8",
-    "sage_attention", "sage_attention_forward", "sage_attention_per_block_int8",
-]
+__all__ = sorted(_OPERATOR_EXPORTS)
 
 
 def __getattr__(name):

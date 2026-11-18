@@ -17,11 +17,8 @@ import triton
 import triton.language as tl
 import triton.experimental.tle.language as tle
 
-_TILE_CONFIGS = [
-    triton.Config({"BLOCK_M": block_m, "BLOCK_N": block_n}, num_warps=num_warps, num_stages=1)
-    for block_m, block_n in ((64, 64), (128, 64), (128, 32))
-    for num_warps in (4, 8)
-]
+from flag_attn.runtime import get_tuned_config
+
 
 
 def _prune_tile_configs(configs, named_args, **kwargs):
@@ -31,7 +28,7 @@ def _prune_tile_configs(configs, named_args, **kwargs):
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                     K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
-                    start_m, mask_ptrs, stride_maskn,
+                    start_m, mask_ptrs, stride_maskn, MASK_IS_BOOL: tl.constexpr,
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
                     ):
@@ -41,7 +38,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
         mask_block = None
         skip = False
         if mask_ptrs is not None:
-            if mask_ptrs.dtype.element_ty == tl.int1:
+            if MASK_IS_BOOL:
                 mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=False)
                 if tl.max(mask_block) == 0:
                     skip = True
@@ -49,14 +46,14 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                 mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=-1.0e6)
         if not skip:
             k_mask = offs_n[None, :] < (kv_len - start_n)
-            k = tl.load(K_ptrs, mask=k_mask, other=0)
+            k = tl.load(K_ptrs, mask=k_mask)
             k_scale = tl.load(K_scale_ptr)
 
             qk = tl.dot(q, k).to(tl.float32) * (q_scale * k_scale)
 
             if mask_block is not None:
-                if mask_block.dtype == tl.int1:
-                    qk = qk + tl.where(mask_block, 0, -1.0e6)
+                if MASK_IS_BOOL:
+                    qk = qk + tl.where(mask_block != 0, 0.0, -1.0e6)
                 else:
                     qk = qk + mask_block
             else:
@@ -72,7 +69,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
 
             acc = acc * alpha[:, None]
 
-            v = tl.load(V_ptrs, mask=offs_n[:, None] < (kv_len - start_n), other=0)
+            v = tl.load(V_ptrs, mask = offs_n[:, None] < (kv_len - start_n))
             p = p.to(tl.float16)
 
             acc += tl.dot(p, v, out_dtype=tl.float16)
@@ -85,7 +82,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
 @triton.jit
 def _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                            K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
-                           start_m, mask_ptrs, stride_maskn,
+                           start_m, mask_ptrs, stride_maskn, MASK_IS_BOOL: tl.constexpr,
                            BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,
                            STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
                            KV_BLOCKS: tl.constexpr, FULL_KV: tl.constexpr,
@@ -99,7 +96,7 @@ def _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
         mask_block = None
         skip = False
         if mask_ptrs is not None:
-            if mask_ptrs.dtype.element_ty == tl.int1:
+            if MASK_IS_BOOL:
                 mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=False)
                 if tl.max(mask_block) == 0:
                     skip = True
@@ -116,8 +113,8 @@ def _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
             qk = tl.dot(q, k).to(tl.float32) * (q_scale * k_scale)
 
             if mask_block is not None:
-                if mask_block.dtype == tl.int1:
-                    qk = qk + tl.where(mask_block, 0, -1.0e6)
+                if MASK_IS_BOOL:
+                    qk = qk + tl.where(mask_block != 0, 0.0, -1.0e6)
                 else:
                     qk = qk + mask_block
             elif not FULL_KV:
@@ -149,7 +146,7 @@ def _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
     return acc, l_i, m_i
 
 @triton.autotune(
-    configs=_TILE_CONFIGS,
+    configs=get_tuned_config("sage_attention_fwd"),
     key=["qo_len", "kv_len", "H", "HEAD_DIM", "num_kv_groups", "RETURN_LSE"],
     prune_configs_by={"early_config_prune": _prune_tile_configs},
     cache_results=True,
@@ -171,6 +168,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
               BLOCK_N: tl.constexpr,
               STAGE: tl.constexpr,
               RETURN_LSE: tl.constexpr,
+              MASK_IS_BOOL: tl.constexpr,
               STATIC_KV: tl.constexpr,
               KV_BLOCKS: tl.constexpr,
               FULL_KV: tl.constexpr,
@@ -207,14 +205,14 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
     q_scale = tl.load(Q_scale_ptr)
     if STATIC_KV:
         acc, l_i, m_i = _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
-                                               start_m, mask_ptrs, stride_maskn,
+                                               start_m, mask_ptrs, stride_maskn, MASK_IS_BOOL,
                                                BLOCK_M, HEAD_DIM, BLOCK_N,
                                                4 - STAGE, offs_m, offs_n, KV_BLOCKS, FULL_KV,
                                                K_SCALE_BLOCK
                                                )
     else:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
-                                        start_m, mask_ptrs, stride_maskn,
+                                        start_m, mask_ptrs, stride_maskn, MASK_IS_BOOL,
                                         BLOCK_M, HEAD_DIM, BLOCK_N,
                                         4 - STAGE, offs_m, offs_n
                                         )
@@ -228,41 +226,12 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
 
 def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
             output_dtype=torch.float16, return_lse=False, maxnreg=None):
+    if maxnreg is not None:
+        if maxnreg <= 0:
+            raise ValueError("maxnreg must be positive")
+        raise NotImplementedError("maxnreg is not supported by the Ascend backend")
+
     stage = 1
-
-    if maxnreg is not None and maxnreg <= 0:
-        raise ValueError("maxnreg must be positive")
-
-    # The Ascend TLE masked-load path is not numerically reliable for partial
-    # KV tiles. Keep the optimized static kernel for unmasked attention and use
-    # an equivalent framework path for the less common explicit-mask case.
-    if attn_mask is not None:
-        q_hnd = q if tensor_layout == "HND" else q.transpose(1, 2)
-        k_hnd = k if tensor_layout == "HND" else k.transpose(1, 2)
-        v_hnd = v if tensor_layout == "HND" else v.transpose(1, 2)
-        q_len = q_hnd.shape[2]
-        k_len = k_hnd.shape[2]
-        q_scale_full = q_scale.repeat_interleave(128, dim=-1)[..., :q_len]
-        k_scale_full = k_scale.repeat_interleave(64, dim=-1)[..., :k_len]
-        q_float = q_hnd.float() * q_scale_full.unsqueeze(-1)
-        k_float = k_hnd.float() * k_scale_full.unsqueeze(-1)
-        v_float = v_hnd.float()
-        groups = q_float.shape[1] // k_float.shape[1]
-        k_float = torch.repeat_interleave(k_float, groups, dim=1)
-        v_float = torch.repeat_interleave(v_float, groups, dim=1)
-        logits = torch.matmul(q_float, k_float.transpose(-1, -2))
-        if attn_mask.dtype == torch.bool:
-            logits = logits.masked_fill(~attn_mask, float("-inf"))
-        else:
-            logits = logits + attn_mask
-        probabilities = torch.softmax(logits * 0.6931471805599453, dim=-1)
-        output = torch.matmul(probabilities, v_float).to(output_dtype)
-        if tensor_layout == "NHD":
-            output = output.transpose(1, 2)
-        if return_lse:
-            lse = torch.logsumexp(logits * 0.6931471805599453, dim=-1) / 0.6931471805599453
-            return output, lse
-        return output, torch.empty([0], dtype=torch.float32, device="cpu")
 
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
 
@@ -300,16 +269,8 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
 
     def grid(meta):
         return (triton.cdiv(qo_len, meta["BLOCK_M"]), h_qo, b)
-    # TLE's asynchronous masked load is not reliable when combined with an
-    # explicit attention mask. Keep the fully static path for the common
-    # unmasked case and use the dynamic load path for masked attention.
-    static_kv = attn_mask is None
-    launch_options = {}
-    if maxnreg is not None:
-        # Triton-Ascend does not expose CUDA's maxnreg launch option. Keep the
-        # argument for API compatibility and validation, but do not forward it.
-        pass
-
+    # Keep static KV loads; long-sequence configs are pruned above.
+    static_kv = True
     _attn_fwd[grid](
         q, k, v, q_scale, k_scale, o, attn_mask, lse,
         stride_bz_q, stride_h_q, stride_seq_q,
@@ -322,6 +283,7 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
         HEAD_DIM=HEAD_DIM_K,
         STAGE=stage, RETURN_LSE=return_lse, STATIC_KV=static_kv,
         Q_SCALE_BLOCK=128, K_SCALE_BLOCK=64,
-        **launch_options)
+        MASK_IS_BOOL=attn_mask is not None and attn_mask.dtype == torch.bool,
+    )
 
     return o, lse
