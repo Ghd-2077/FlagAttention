@@ -255,6 +255,8 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
         raise ValueError(f"tensor_layout {tensor_layout} not supported")
 
     if attn_mask is not None:
+        # Broadcast dimensions need zero strides before per-batch/head addressing.
+        attn_mask = attn_mask.expand(b, h_qo, qo_len, kv_len)
         stride_bz_mask, stride_h_mask, stride_m_mask, stride_n_mask = attn_mask.stride(0), attn_mask.stride(1), attn_mask.stride(2), attn_mask.stride(3)
     else:
         stride_bz_mask, stride_h_mask, stride_m_mask, stride_n_mask = 0, 0, 0, 0
