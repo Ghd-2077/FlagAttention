@@ -118,12 +118,14 @@ def test_forward_rejects_non_positive_maxnreg():
 
 
 @pytest.mark.sage_attention
+@pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
+@pytest.mark.parametrize("batch_size,num_query_heads,num_kv_heads", [(1, 1, 1), (2, 4, 2)])
 @pytest.mark.parametrize("mask_kind", ["bool", "additive"])
 @pytest.mark.parametrize("kv_len", [70, 257])
-def test_forward_supports_masks_and_partial_blocks(mask_kind, kv_len):
+def test_forward_supports_masks_and_partial_blocks(mask_kind, kv_len, batch_size, num_query_heads, num_kv_heads, tensor_layout):
     torch.manual_seed(7)
-    q = torch.randn((1, 1, 129, 128), device=test_backend.device, dtype=torch.float16)
-    k = torch.randn((1, 1, kv_len, 128), device=test_backend.device, dtype=torch.float16)
+    q = torch.randn((batch_size, num_query_heads, 129, 128), device=test_backend.device, dtype=torch.float16)
+    k = torch.randn((batch_size, num_kv_heads, kv_len, 128), device=test_backend.device, dtype=torch.float16)
     v = torch.randn_like(k)
 
     if mask_kind == "bool":
@@ -133,7 +135,10 @@ def test_forward_supports_masks_and_partial_blocks(mask_kind, kv_len):
         attn_mask = torch.zeros((1, 1, 129, kv_len), device=test_backend.device, dtype=torch.float32)
         attn_mask[..., ::3] = -2.0
 
-    q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k)
+    if tensor_layout == "NHD":
+        q, k, v = [x.transpose(1, 2).contiguous() for x in (q, k, v)]
+    # A singleton batch/head mask broadcasts to grouped-query inputs.
+    q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k, tensor_layout=tensor_layout)
     actual, actual_lse = sage_attention(
         q_int8,
         k_int8,
@@ -141,6 +146,7 @@ def test_forward_supports_masks_and_partial_blocks(mask_kind, kv_len):
         q_scale,
         k_scale,
         attn_mask=attn_mask,
+        tensor_layout=tensor_layout,
         return_lse=True,
     )
     expected, expected_lse = _reference(
@@ -149,7 +155,7 @@ def test_forward_supports_masks_and_partial_blocks(mask_kind, kv_len):
         v,
         q_scale,
         k_scale,
-        "HND",
+        tensor_layout,
         attn_mask,
     )
 
