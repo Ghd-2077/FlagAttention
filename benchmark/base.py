@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+
 import gc
 import os
 from typing import Any, Generator
@@ -23,6 +24,12 @@ from typing import Any, Generator
 import pytest
 import torch
 import triton
+from flag_attn.testing import backend as test_backend
+
+try:
+    from benchmark.recording import benchmark_metric, record_benchmark_result
+except ModuleNotFoundError:  # Direct execution from the benchmark directory.
+    from recording import benchmark_metric, record_benchmark_result
 
 
 class Benchmark:
@@ -93,19 +100,20 @@ class Benchmark:
     def get_latency(op, *args, **kwargs) -> float:
         warmup_ms = int(os.getenv("FLAG_ATTN_KDA_BENCH_WARMUP_MS", "100"))
         repetition_ms = int(os.getenv("FLAG_ATTN_KDA_BENCH_REP_MS", "500"))
-        return triton.testing.do_bench(
+        return test_backend.do_bench(
             lambda: op(*args, **kwargs),
             warmup=warmup_ms,
             rep=repetition_ms,
             return_mode="median",
         )
 
-    def run(self) -> None:
+    def run(self, record_property=None) -> None:
         if self.gems_op is None:
             raise RuntimeError("FlagAttention benchmark callable has not been set")
 
         self.init_user_config()
         for dtype in self.to_bench_dtypes:
+            metrics = []
             for input_tuple in self.get_input_iter(dtype):
                 args, kwargs = self.unpack_to_args_kwargs(input_tuple)
                 try:
@@ -116,6 +124,14 @@ class Benchmark:
 
                 speedup = latency_base / latency
                 shape_detail = self.record_shapes(*args, **kwargs)
+                metrics.append(
+                    benchmark_metric(
+                        shape_detail=shape_detail,
+                        latency_base=latency_base,
+                        latency=latency,
+                        speedup=speedup,
+                    )
+                )
                 print(
                     f"Operator={self.op_name} dtype={dtype} "
                     f"latency_base={latency_base:.6f} ms "
@@ -129,3 +145,11 @@ class Benchmark:
                 gc.collect()
                 if hasattr(torch, "gcu"):
                     torch.gcu.empty_cache()
+
+            record_benchmark_result(
+                record_property,
+                op_name=self.op_name,
+                dtype=str(dtype),
+                result=metrics,
+                baseline="torch_reference",
+            )

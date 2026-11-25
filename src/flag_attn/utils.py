@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import importlib
 import re
 from collections.abc import Callable
 from typing import Any
@@ -25,8 +26,15 @@ from typing import Any
 import torch
 
 
-def has_triton_tle(major: int = 0, minor: int = 0, patch: int = 0) -> bool:
-    """Return whether the installed Triton exposes the requested TLE API."""
+def has_triton_tle(
+    major: int = 0, minor: int = 0, patch: int = 0, *,
+    required_api: tuple[str, ...] = (),
+) -> bool:
+    """Check TLE availability/version and optional APIs relative to its language.
+
+    For example, required_api=("gpu.types.BlockEncoding", "gpu.set_layout")
+    checks the interfaces needed by a kernel without importing that kernel.
+    """
     try:
         import triton
         import triton.experimental.tle.language  # noqa: F401
@@ -35,7 +43,31 @@ def has_triton_tle(major: int = 0, minor: int = 0, patch: int = 0) -> bool:
     parts = re.findall(r"\d+", str(getattr(triton, "__version__", "0.0.0")))
     values = [int(part) for part in parts[:3]]
     values += [0] * (3 - len(values))
-    return tuple(values[:3]) >= (major, minor, patch)
+    if tuple(values[:3]) < (major, minor, patch):
+        return False
+    for name in required_api:
+        module_name, _, attribute = name.rpartition(".")
+        module_name = "triton.experimental.tle.language" + (
+            "." + module_name if module_name else ""
+        )
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            return False
+        if not hasattr(module, attribute):
+            return False
+    return True
+
+
+def is_sm90_device(device: torch.device | None = None) -> bool:
+    """Return whether a CUDA device has compute capability 9.0."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        capability = torch.cuda.get_device_capability(device)
+    except (RuntimeError, TypeError, ValueError):
+        return False
+    return capability == (9, 0)
 
 
 def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
@@ -51,14 +83,9 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
                 len(args) == len(last_args)
                 and len(kwargs) == len(last_kwargs)
                 and all(a is b for a, b in zip(args, last_args))
-                and all(
-                    key in last_kwargs and value is last_kwargs[key]
-                    for key, value in kwargs.items()
-                )
+                and all(key in last_kwargs and value is last_kwargs[key] for key, value in kwargs.items())
             ):
-                cache_entries = cache_entries[:i] + cache_entries[i + 1:] + [
-                    (args, kwargs, last_result)
-                ]
+                cache_entries = cache_entries[:i] + cache_entries[i + 1 :] + [(args, kwargs, last_result)]
                 return last_result
         result = fn(*args, **kwargs)
         if len(cache_entries) >= cache_size:
@@ -74,13 +101,9 @@ def input_guard(fn: Callable[..., Any]) -> Callable[..., Any]:
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        contiguous_args = (
-            value if not isinstance(value, torch.Tensor) else value.contiguous()
-            for value in args
-        )
+        contiguous_args = (value if not isinstance(value, torch.Tensor) else value.contiguous() for value in args)
         contiguous_kwargs = {
-            key: value if not isinstance(value, torch.Tensor) else value.contiguous()
-            for key, value in kwargs.items()
+            key: value if not isinstance(value, torch.Tensor) else value.contiguous() for key, value in kwargs.items()
         }
         tensor = next((value for value in args if isinstance(value, torch.Tensor)), None)
         if tensor is None:
@@ -88,11 +111,7 @@ def input_guard(fn: Callable[..., Any]) -> Callable[..., Any]:
                 (value for value in kwargs.values() if isinstance(value, torch.Tensor)),
                 None,
             )
-        ctx = (
-            torch.cuda.device(tensor.device)
-            if tensor is not None and tensor.is_cuda
-            else contextlib.nullcontext()
-        )
+        ctx = torch.cuda.device(tensor.device) if tensor is not None and tensor.is_cuda else contextlib.nullcontext()
         with ctx:
             return fn(*contiguous_args, **contiguous_kwargs)
 

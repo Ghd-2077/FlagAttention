@@ -15,12 +15,14 @@
 import itertools
 import math
 
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from benchmark.base import Benchmark
-from flag_attn.runtime.backend._enflame.kda import chunk_kda
+from flag_attn.testing import backend as test_backend
+from flag_attn.runtime.backend._enflame.FLA.kda import chunk_kda
 
 DEVICE = "gcu"
 LOWER_BOUND = -5.0
@@ -37,7 +39,7 @@ FLASHKDA_CASES = FIXED_CASES + VARLEN_CASES
 
 
 def _gcu_available() -> bool:
-    return hasattr(torch, "gcu") and torch.gcu.is_available()
+    return test_backend.runtime.device.vendor_name == "enflame" and test_backend.is_available()
 
 
 def _chunk_kda_inference_op(*args, **kwargs):
@@ -271,10 +273,11 @@ class ChunkKDABenchmark(Benchmark):
     reason="chunk_kda benchmark requires an available Enflame GCU",
 )
 @pytest.mark.chunk_kda
-def test_chunk_kda():
+@pytest.mark.chunk_kda_enflame
+def test_chunk_kda(record_property):
     bench = ChunkKDABenchmark(
         op_name="chunk_kda",
         torch_op=_chunk_kda_torch_reference_op,
     )
     bench.set_gems(_chunk_kda_inference_op)
-    bench.run()
+    bench.run(record_property)

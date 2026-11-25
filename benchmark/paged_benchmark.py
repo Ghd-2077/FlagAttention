@@ -12,15 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+import math
 import torch
 import triton
+from flag_attn.testing import backend as test_backend
 import flag_attn
+
+try:
+    from benchmark.recording import record_triton_report
+except ModuleNotFoundError:  # Direct execution from the benchmark directory.
+    from recording import record_triton_report
 
 NUM_BLOCKS = 1000
 warmup = 200
 rep = 200
 
 try:
+    if not test_backend.is_nvidia():
+        raise ImportError("CUDA comparison is unavailable on the selected backend")
     from vllm._C import ops as vllm_ops
 
     HAS_VLLM = True
@@ -29,8 +39,9 @@ try:
     import vllm
 
     print("vllm.__version__", vllm.__version__)
-except BaseException:
+except Exception as exc:
     HAS_VLLM = False
+    VLLM_IMPORT_ERROR = str(exc)
 
 
 def vllm_paged_attention(
@@ -123,7 +134,7 @@ def vllm_paged_attention(
         for query_group_size in [1, 8]
         for head_size in [64, 128]
         for block_size in [16, 32]
-        for version in [1, 2]
+        for version in ([1, 2] if HAS_VLLM else [1])
         for dtype in [torch.float16]
     ]
 )
@@ -137,7 +148,7 @@ def paged_attention_benchmark_with_vllm(
     vllm_version,
     provider,
     dtype=torch.float16,
-    device="cuda",
+    device=test_backend.device,
 ):
     num_kv_heads = num_query_heads // query_group_size
 
@@ -175,7 +186,7 @@ def paged_attention_benchmark_with_vllm(
             attn_scale,
             context_len,
         )
-        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+        ms = test_backend.do_bench(fn, warmup=warmup, rep=rep)
 
     if provider == "vllm":
         # Correctness error, does not affect performance results
@@ -193,11 +204,33 @@ def paged_attention_benchmark_with_vllm(
             PARTITION_SIZE=512,
             version=vllm_version,
         )
-        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+        ms = test_backend.do_bench(fn, warmup=warmup, rep=rep)
 
     total_flops = 2.0 * num_seqs * num_query_heads * 2 * context_len * head_size
     return total_flops / ms * 1e-9
 
 
-if HAS_VLLM:
-    paged_attention_benchmark_with_vllm.run(print_data=True)
+if not HAS_VLLM:
+    print(f"[baseline] vLLM 0.3 paged attention unavailable: {VLLM_IMPORT_ERROR}")
+def _latency_from_tflops(tflops, shape):
+    if not math.isfinite(tflops) or tflops <= 0:
+        return math.inf
+    flops = (
+        4.0
+        * shape['num_seqs']
+        * shape['num_query_heads']
+        * shape['context_len']
+        * shape['head_size']
+    )
+    return flops / tflops * 1e-9
+
+
+results = paged_attention_benchmark_with_vllm.run(print_data=True, return_df=True)
+record_triton_report(
+    paged_attention_benchmark_with_vllm,
+    results,
+    op_name='paged_attention',
+    provider='triton',
+    baseline='vllm',
+    latency_from_value=_latency_from_tflops,
+)
