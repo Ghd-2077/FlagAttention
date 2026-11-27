@@ -4,6 +4,11 @@
 import importlib
 
 _OPERATOR_EXPORTS = {
+    "minimax_m3_index_score": (".minimax_sparse_attention.index_topk", "minimax_m3_index_score"),
+    "minimax_m3_index_topk": (".minimax_sparse_attention.index_topk", "minimax_m3_index_topk"),
+    "minimax_m3_index_decode_score": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode_score"),
+    "minimax_m3_index_decode": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode"),
+    "minimax_m3_sparse_attn": (".minimax_sparse_attention.sparse_attn", "minimax_m3_sparse_attn"),
     "chunk_gated_delta_rule": (".FLA.gated_delta_rule.api", "chunk_gated_delta_rule"),
     "chunk_gated_delta_rule_fwd": (".FLA.gated_delta_rule.chunk", "chunk_gated_delta_rule_fwd"),
     "fused_recurrent_gated_delta_rule_fwd": (
