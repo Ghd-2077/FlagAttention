@@ -40,6 +40,7 @@ from __future__ import annotations
 import ast
 import inspect
 import math
+import os
 import sys
 import textwrap
 import warnings
@@ -119,9 +120,13 @@ class _CachedPlatform:
 
 _flag_attn_index_module = sys.modules[minimax_m3_index_decode.__module__]
 _flag_attn_sparse_module = sys.modules[minimax_m3_sparse_attn_decode.__module__]
-_flag_attn_platform = _CachedPlatform(_flag_attn_index_module.current_platform)
-_flag_attn_index_module.current_platform = _flag_attn_platform
-_flag_attn_sparse_module.current_platform = _flag_attn_platform
+# The PDL cache is a CUDA/vLLM concept. Non-NVIDIA backends (e.g. Ascend)
+# do not export current_platform, so only patch it when present.
+_flag_attn_platform = getattr(_flag_attn_index_module, "current_platform", None)
+if _flag_attn_platform is not None:
+    _flag_attn_platform = _CachedPlatform(_flag_attn_platform)
+    _flag_attn_index_module.current_platform = _flag_attn_platform
+    _flag_attn_sparse_module.current_platform = _flag_attn_platform
 
 if VLLM_AVAILABLE and runtime.device.vendor_name in VLLM_BASELINE_VENDORS:
     _vllm_index_module = sys.modules[vllm_index_decode.__module__]
@@ -772,24 +777,40 @@ def _bench_steps(
     }
 
 
-def _parse_shape(value: str) -> tuple[int, int, int, int]:
+def _parse_shape(value: str) -> tuple[int, ...]:
+    """Parse "B,S,KVH,H" (query length follows S) or "B,Q,S,KVH,H"."""
     try:
         shape = tuple(int(item) for item in value.split(","))
     except ValueError as exc:
         raise ValueError(
-            "--shape must contain four comma-separated integers: "
-            "batch,seq_len,num_kv_heads,num_heads"
+            "--shape must contain comma-separated integers: "
+            "batch,seq_len,num_kv_heads,num_heads or "
+            "batch,query_len,seq_len,num_kv_heads,num_heads"
         ) from exc
-    if len(shape) != 4 or any(item <= 0 for item in shape):
+    if len(shape) not in (4, 5) or any(item <= 0 for item in shape):
         raise ValueError(
-            "--shape must contain four positive integers: "
-            "batch,seq_len,num_kv_heads,num_heads"
+            "--shape must contain four or five positive integers: "
+            "batch,seq_len,num_kv_heads,num_heads or "
+            "batch,query_len,seq_len,num_kv_heads,num_heads"
         )
     return shape
 
 
 def _get_shapes(args: MSABenchmarkArgs) -> list[tuple[int, int, int, int, int]]:
     shapes = DECODE_SHAPES if args.decode else PREFILL_SHAPES
+    override = os.environ.get("MSA_BENCH_SHAPES", "").strip()
+    if override:
+        # Format: "B,S,KVH,H" or "B,Q,S,KVH,H" groups separated by ";".
+        # Backend-neutral escape hatch so any backend can run a bounded subset.
+        parsed = []
+        for entry in override.split(";"):
+            values = _parse_shape(entry.strip())
+            if len(values) == 4:
+                batch, seq_len, num_kv_heads, num_heads = values
+                parsed.append((batch, seq_len, seq_len, num_kv_heads, num_heads))
+            else:
+                parsed.append(values)
+        shapes = parsed
     return [(b, args.decode_qlen if args.decode else q, seq, kh, h) for b, q, seq, kh, h in shapes]
 
 
@@ -1092,6 +1113,12 @@ def run_benchmark(
 )
 def test_msa_benchmark(request, record_property) -> None:
     """Run the MSA benchmark through pytest using benchmark CLI timing options."""
+    # The built-in matrix is sized for NVIDIA GPUs. Other backends opt into a
+    # bounded subset with MSA_BENCH_SHAPES="B,S,KVH,H;B,S,KVH,H;...".
+    if not test_backend.is_nvidia() and not os.environ.get("MSA_BENCH_SHAPES", "").strip():
+        pytest.skip(
+            "set MSA_BENCH_SHAPES to run a bounded shape subset on this backend"
+        )
     args = MSABenchmarkArgs(
         dtype=request.config.getoption("--dtype"),
         stage=request.config.getoption("--stage"),
